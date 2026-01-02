@@ -526,15 +526,17 @@
         isAutolabeling = true;
         
         document.getElementById('autolabel-grid').innerHTML = '';
-        document.getElementById('autolabel-status').innerText = "Starting inference...";
+        document.getElementById('autolabel-status').innerText = "Initializing inference stream...";
 
-        // Start Infinite Scroll Observer for RENDERING
+        // Start Infinite Scroll Observer
         if (autolabelObserver) autolabelObserver.disconnect();
         const sentinel = document.getElementById('autolabel-sentinel');
         const callback = (entries) => {
-            if (entries[0].isIntersecting) renderMoreAutolabel();
+            if (entries[0].isIntersecting) {
+                renderMoreAutolabel();
+            }
         };
-        autolabelObserver = new IntersectionObserver(callback, { root: null, rootMargin: '100px', threshold: 0.1 });
+        autolabelObserver = new IntersectionObserver(callback, { root: null, rootMargin: '200px', threshold: 0.1 });
         autolabelObserver.observe(sentinel);
 
         // Start Fetch Loop
@@ -544,34 +546,29 @@
     async function fetchAutolabelChunks() {
         while (isAutolabeling) {
             try {
-                // Check if tab is still active, else pause? 
-                // For now, let it run to completion even if switched away, 
-                // or break if user explicitly leaves? (Simplified: run until done)
-                
                 const res = await fetch(`/api/data_view?mode=model&offset=${autolabelFetchedCount}&limit=${CHUNK_SIZE}`);
                 const data = await res.json();
                 
                 if (data.items.length === 0) {
                     isAutolabeling = false;
-                    document.getElementById('autolabel-status').innerText = `Completed. Total: ${autolabelData.length}`;
+                    document.getElementById('autolabel-status').innerText = `Done. Total: ${autolabelData.length} items.`;
+                    renderMoreAutolabel();
                     break;
                 }
 
-                // Merge Logic: Add new items
-                // Use a Map to ensure unique by ID? (Assuming backend doesn't overlap)
-                // Just concat for now as offset increments correctly.
+                // 1. Merge new data
                 autolabelData.push(...data.items);
                 autolabelFetchedCount += data.items.length;
 
-                // Sort: By confidence descending
+                // 2. Re-Sort entire list by confidence (Descending)
                 autolabelData.sort((a, b) => (b.model_conf || 0) - (a.model_conf || 0));
 
-                // Update Status
-                document.getElementById('autolabel-status').innerText = `Fetched: ${autolabelFetchedCount} | Sorted & Merged`;
+                // 3. Update Status
+                document.getElementById('autolabel-status').innerText = `Fetching: ${autolabelFetchedCount} / ${data.total} | Sorted`;
 
-                // If grid is empty or small, render immediately
-                if (autolabelRenderCount < 50) {
-                    renderMoreAutolabel();
+                // 4. Reactive Rendering: Re-render visible portion if early in the list
+                if (autolabelRenderCount < 100) {
+                    renderGridSafe();
                 }
 
             } catch (e) {
@@ -583,46 +580,40 @@
     }
 
     function renderMoreAutolabel() {
-        // Render next batch from LOCAL SORTED autolabelData
-        const grid = document.getElementById('autolabel-grid');
-        const BATCH = 50;
-        
-        const nextItems = autolabelData.slice(autolabelRenderCount, autolabelRenderCount + BATCH);
-        if (nextItems.length === 0) return;
+        autolabelRenderCount += 50; 
+        renderGridSafe();
+    }
 
-        // Note: With sorting, the 'top' items might change as new data comes in.
-        // A simple append strategy works for "filling up", but if we want to reflect the NEW sort order
-        // we strictly should re-render the whole grid. 
-        // OPTIMIZATION: Re-render visible part only?
-        // For simplicity and "Gradual Merge" visual effect: 
-        // Let's CLEAR and RE-RENDER visible amount + buffer.
-        
-        const limit = Math.max(autolabelRenderCount + BATCH, 100); // Ensure at least 100 or current
-        autolabelRenderCount = limit;
-        
-        const itemsToShow = autolabelData.slice(0, limit);
-        
-        grid.innerHTML = ''; // Full re-render to ensure sort order correctness
-        
-        itemsToShow.forEach(item => {
-            const card = document.createElement('div');
-            card.className = 'card';
-            if (item.model_label === 1) card.classList.add('auto-pos');
-            else if (item.model_label === 0) card.classList.add('auto-neg');
+    function renderGridSafe() {
+        const grid = document.getElementById('autolabel-grid');
+        const limit = Math.min(autolabelRenderCount, autolabelData.length);
+        if (limit === 0) return;
+
+        let html = '';
+        for (let i = 0; i < limit; i++) {
+            const item = autolabelData[i];
+            let cls = 'card';
+            if (item.model_label === 1) cls += ' auto-pos';
+            else if (item.model_label === 0) cls += ' auto-neg';
             
             const conf = item.model_conf !== undefined ? (item.model_conf * 100).toFixed(0) : '?';
             
-            card.innerHTML = `
-                <img src="/api/image/${item.id}" loading="lazy" title="#${item.id}">
-                <div class="card-overlay">
-                    <span>#${item.id}</span>
-                    <span>${conf}%</span>
+            html += `
+                <div class="${cls}">
+                    <img src="/api/image/${item.id}" loading="lazy" title="#${item.id}">
+                    <div class="card-overlay">
+                        <span>#${item.id}</span>
+                        <span>${conf}%</span>
+                    </div>
                 </div>
             `;
-            grid.appendChild(card);
-        });
+        }
+        grid.innerHTML = html;
+        
+        if (limit < autolabelData.length && grid.scrollHeight < window.innerHeight) {
+             renderMoreAutolabel();
+        }
     }
-
 
     // --- Audio Logic ---
 
