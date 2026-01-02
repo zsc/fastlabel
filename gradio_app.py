@@ -211,6 +211,10 @@ class SessionState:
 def init_app():
     return SessionState()
 
+def on_load_click(session, strategy):
+    session, images, title = load_next_batch(session, strategy)
+    return session, images, title
+
 def get_embedding_safe(idx, session):
     if idx not in session.embed_cache:
         img = data_source.get_image(idx)
