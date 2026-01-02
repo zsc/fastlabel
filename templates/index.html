@@ -84,6 +84,8 @@
         button:disabled { background-color: #ccc; cursor: not-allowed; }
         button.secondary { background-color: #6c757d; }
         button.submit-btn { background-color: #28a745; }
+        button.undo-btn { background-color: #dc3545; }
+        button.undo-btn:hover { background-color: #c82333; }
 
         input[type="text"] {
             padding: 8px 12px;
@@ -262,6 +264,7 @@
 
         <div style="flex-grow: 1;"></div>
         
+        <button class="undo-btn" id="undo-btn" onclick="undoLastStep()" disabled>Undo</button>
         <button onclick="loadBatch()">Load Batch</button>
         <button class="submit-btn" id="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
     </div>
@@ -365,6 +368,9 @@
             currentBatchType = data.batch_type;
             currentDataType = data.data_type;
             
+            // Enable/Disable Undo based on backend state
+            document.getElementById('undo-btn').disabled = !data.undo_available;
+
             updateUIForBatchType();
             renderGrid();
             document.getElementById('submit-btn').disabled = false;
@@ -450,6 +456,30 @@
             document.getElementById('labeled-count').innerText = result.labeled_count;
             document.getElementById('unlabeled-count').innerText = result.unlabeled_count;
             await loadBatch();
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    async function undoLastStep() {
+        if (!confirm("Are you sure you want to undo the last batch and training?")) return;
+        
+        showLoading(true);
+        try {
+            const res = await fetch('/api/undo', { method: 'POST' });
+            const data = await res.json();
+            
+            if (data.success) {
+                alert("Undo successful!");
+                document.getElementById('labeled-count').innerText = data.labeled_count;
+                document.getElementById('unlabeled-count').innerText = data.unlabeled_count;
+                // Reload current batch to reflect state change (might be different strategy or model)
+                await loadBatch();
+            } else {
+                alert("Nothing to undo.");
+            }
+        } catch (e) {
+            alert("Error during undo.");
         } finally {
             showLoading(false);
         }

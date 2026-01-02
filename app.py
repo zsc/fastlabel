@@ -7,6 +7,7 @@ import base64
 import numpy as np
 import glob
 import requests
+import copy
 from PIL import Image
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -135,6 +136,13 @@ class CelebADataSource:
 # --- State Management ---
 
 @dataclass
+class Snapshot:
+    labeled: Dict[int, int]
+    unlabeled: List[int]
+    model_state: Optional[Dict[str, Any]]
+    optimizer_state: Optional[Dict[str, Any]]
+
+@dataclass
 class State:
     data_source: Any = field(default_factory=CelebADataSource)
     labeled: Dict[int, int] = field(default_factory=dict) # Index -> Label
@@ -145,11 +153,54 @@ class State:
     text_query: Optional[str] = None
     text_embedding: Optional[torch.Tensor] = None
     current_batch_type: str = "neutral"
+    
+    # Undo History
+    history: List[Snapshot] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-app_state = State()
+    def save_snapshot(self):
+        """Save current state to history (limit 3)."""
+        model_state = self.model.state_dict() if self.model else None
+        opt_state = self.optimizer.state_dict() if self.optimizer else None
+        
+        # Deepcopy mutable structures
+        snapshot = Snapshot(
+            labeled=copy.deepcopy(self.labeled),
+            unlabeled=copy.deepcopy(self.unlabeled),
+            model_state=copy.deepcopy(model_state) if model_state else None,
+            optimizer_state=copy.deepcopy(opt_state) if opt_state else None
+        )
+        self.history.append(snapshot)
+        if len(self.history) > 3:
+            self.history.pop(0)
 
-# Initialize default unlabeled pool for CelebA
+    def restore_snapshot(self):
+        """Restore last state from history."""
+        if not self.history:
+            return False
+        
+        snapshot = self.history.pop()
+        self.labeled = snapshot.labeled
+        self.unlabeled = snapshot.unlabeled
+        
+        if snapshot.model_state:
+            # Re-init model if it was None but snapshot has it (unlikely in this flow but possible)
+            if self.model is None:
+                # Need input dim to init. Can guess from embed cache or just re-init on fly
+                # Assuming embedding dim 512 for ViT-B-32
+                self.model = MLPHead(512, NUM_CLASSES).to(DEVICE)
+                self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+            
+            self.model.load_state_dict(snapshot.model_state)
+            if snapshot.optimizer_state and self.optimizer:
+                self.optimizer.load_state_dict(snapshot.optimizer_state)
+        else:
+            self.model = None
+            self.optimizer = None
+            
+        return True
+
+app_state = State()
 app_state.unlabeled = list(range(TOTAL_IMAGES))
 random.shuffle(app_state.unlabeled)
 
@@ -184,7 +235,9 @@ def get_embedding(idx: int) -> np.ndarray:
 
 def init_mlp_if_needed():
     if app_state.model is None:
-        sample_embed = get_embedding(app_state.unlabeled[0] if app_state.unlabeled else 0)
+        # Infer input dim from first available embedding
+        first_id = app_state.unlabeled[0] if app_state.unlabeled else (list(app_state.labeled.keys())[0] if app_state.labeled else 0)
+        sample_embed = get_embedding(first_id)
         input_dim = sample_embed.shape[0]
         app_state.model = MLPHead(input_dim, NUM_CLASSES).to(DEVICE)
         app_state.optimizer = optim.Adam(app_state.model.parameters(), lr=1e-3)
@@ -291,6 +344,7 @@ def set_config():
         app_state.embed_cache = {}
         app_state.model = None
         app_state.optimizer = None
+        app_state.history = [] # Reset history on config change
     return jsonify({"success": True, "count": len(app_state.unlabeled), "type": data_type})
 
 @app.route('/api/set_query', methods=['POST'])
@@ -344,18 +398,28 @@ def next_batch():
         if batch_type == "positive": response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
         elif batch_type == "negative": response_data.sort(key=lambda x: x['prob_pos'])
         else: response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
-    return jsonify({"items": response_data, "batch_type": batch_type, "data_type": app_state.data_source.data_type})
+    return jsonify({"items": response_data, "batch_type": batch_type, "data_type": app_state.data_source.data_type, "undo_available": len(app_state.history) > 0})
 
 @app.route('/api/submit_labels', methods=['POST'])
 def submit_labels():
     data = request.json
     with app_state.lock:
+        # Save snapshot BEFORE updating
+        app_state.save_snapshot()
+        
         for item in data:
             idx = item['id']; label = int(item['label'])
             app_state.labeled[idx] = label
             if idx in app_state.unlabeled: app_state.unlabeled.remove(idx)
         if len(app_state.labeled) >= 2: train_step()
+        
     return jsonify({"success": True, "labeled_count": len(app_state.labeled), "unlabeled_count": len(app_state.unlabeled)})
+
+@app.route('/api/undo', methods=['POST'])
+def undo_last_step():
+    with app_state.lock:
+        success = app_state.restore_snapshot()
+    return jsonify({"success": success, "labeled_count": len(app_state.labeled), "unlabeled_count": len(app_state.unlabeled)})
 
 @app.route('/api/image/<int:idx>')
 def get_image(idx):
