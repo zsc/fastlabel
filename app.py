@@ -446,6 +446,58 @@ def get_labeled_data():
             grouped[lbl_str].append(idx)
     return jsonify(grouped)
 
+@app.route('/api/data_view')
+def data_view():
+    if not app_state.data_source:
+        return jsonify({"items": [], "total": 0})
+
+    mode = request.args.get('mode', 'dataset') # 'dataset' or 'model'
+    try:
+        offset = int(request.args.get('offset', 0))
+        limit = int(request.args.get('limit', 50))
+    except ValueError:
+        offset = 0; limit = 50
+    
+    limit = min(limit, 100) # Clamp limit
+    total_count = len(app_state.data_source.file_list)
+    end_idx = min(offset + limit, total_count)
+    indices = list(range(offset, end_idx))
+    
+    response_items = []
+    
+    # Context manager for thread safety if accessing shared model/state
+    with app_state.lock:
+        # Pre-calc predictions if needed
+        model_preds = {}
+        if mode == 'model':
+            probs, preds = predict_batch(indices)
+            for i, idx in enumerate(indices):
+                model_preds[idx] = (preds[i], probs[i])
+
+        for idx in indices:
+            item = {
+                "id": idx,
+                "filename": os.path.basename(str(app_state.data_source.file_list[idx])),
+            }
+            
+            # User Label info
+            item["user_label"] = app_state.labeled.get(idx)
+            
+            # Model info
+            if mode == 'model':
+                p_label, p_probs = model_preds[idx]
+                item["model_label"] = int(p_label)
+                item["model_conf"] = float(p_probs[1]) # Prob of positive
+                
+            response_items.append(item)
+            
+    return jsonify({
+        "items": response_items,
+        "total": total_count,
+        "offset": offset,
+        "limit": limit
+    })
+
 @app.route('/api/export')
 def export_labels():
     results = []
