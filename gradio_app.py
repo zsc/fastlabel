@@ -53,15 +53,16 @@ clip_model.eval()
 tokenizer = open_clip.get_tokenizer('ViT-B-32')
 print("CLIP initialized.")
 
-# --- GPU Functions ---
+# --- Batched GPU Functions ---
 
 @spaces.GPU
-def extract_feature_gpu(image: Image.Image) -> np.ndarray:
-    image_tensor = clip_preprocess(image).unsqueeze(0).to(DEVICE)
+def extract_features_batch_gpu(images: List[Image.Image]) -> np.ndarray:
+    """Extract CLIP features for a batch of images."""
+    tensors = torch.stack([clip_preprocess(img) for img in images]).to(DEVICE)
     with torch.no_grad():
-        features = clip_model.encode_image(image_tensor)
+        features = clip_model.encode_image(tensors)
         features /= features.norm(dim=-1, keepdim=True)
-    return features.cpu().numpy()[0]
+    return features.cpu().numpy()
 
 @spaces.GPU
 def encode_text_gpu(text: str) -> torch.Tensor:
@@ -98,7 +99,7 @@ def train_step_gpu(model_state, labeled_data, embed_cache):
 
 @spaces.GPU
 def predict_batch_gpu(model_state, text_embed, embeddings_list):
-    # If we have a model, use it
+    # Case 1: Active Learning Model
     if model_state is not None:
         model = MLPHead(512, 2).to(DEVICE)
         model.load_state_dict(model_state)
@@ -111,7 +112,7 @@ def predict_batch_gpu(model_state, text_embed, embeddings_list):
             _, preds = torch.max(probs, 1)
         return probs.cpu().numpy(), preds.cpu().numpy()
     
-    # Fallback: Zero-shot text
+    # Case 2: Zero-shot Text
     if text_embed is not None:
         X = torch.tensor(np.array(embeddings_list), dtype=torch.float32).to(DEVICE)
         text_feat = text_embed.to(DEVICE)
@@ -125,7 +126,7 @@ def predict_batch_gpu(model_state, text_embed, embeddings_list):
             preds = (probs_pos > 0.5).long()
         return probs.cpu().numpy(), preds.cpu().numpy()
 
-    # Fallback: Random
+    # Case 3: Random
     n = len(embeddings_list)
     return np.ones((n, 2)) / 2, np.zeros(n)
 
@@ -169,18 +170,14 @@ class SessionState:
     unlabeled: List[int] = field(default_factory=list)
     embed_cache: Dict[int, np.ndarray] = field(default_factory=dict)
     model_state: Optional[Dict] = None
-    
     text_query: Optional[str] = None
     text_embedding: Optional[torch.Tensor] = None
-    
     current_batch_ids: List[int] = field(default_factory=list)
     current_batch_mode: str = "neutral"
-    
     history: List[Snapshot] = field(default_factory=list)
 
     def __init__(self):
         self.labeled = {}
-        # Limit pool for demo speed in Gradio
         self.unlabeled = list(range(2000)) 
         random.shuffle(self.unlabeled)
         self.embed_cache = {}
@@ -211,60 +208,52 @@ class SessionState:
 def init_app():
     return SessionState()
 
-def on_load_click(session, strategy):
-    session, images, title = load_next_batch(session, strategy)
-    return session, images, title
-
-def get_embedding_safe(idx, session):
-    if idx not in session.embed_cache:
-        img = data_source.get_image(idx)
-        session.embed_cache[idx] = extract_feature_gpu(img)
-    return session.embed_cache[idx]
+def get_embeddings_batch(ids: List[int], session: SessionState):
+    """Fetch embeddings for a list of IDs, batching GPU calls for missing ones."""
+    missing_ids = [i for i in ids if i not in session.embed_cache]
+    if missing_ids:
+        images = [data_source.get_image(i) for i in missing_ids]
+        # BATCHED GPU CALL
+        feats = extract_features_batch_gpu(images)
+        for i, gid in enumerate(missing_ids):
+            session.embed_cache[gid] = feats[i]
+    return [session.embed_cache[i] for i in ids]
 
 def on_set_query(session, query):
     if not query:
         session.text_query = None
         session.text_embedding = None
         return session, "Query cleared."
-    
     session.text_query = query
     session.text_embedding = encode_text_gpu(query)
     return session, f"Query set: '{query}'. Use 'Verify Positives' now."
 
 def load_next_batch(session: SessionState, strategy: str):
-    # Sample pool for prediction
     pool_size = min(len(session.unlabeled), 500)
     pool = session.unlabeled[:pool_size]
-    
     if not pool:
         return session, [], "No more data"
 
-    pool_embeds = [get_embedding_safe(i, session) for i in pool]
+    # Batched embedding retrieval
+    pool_embeds = get_embeddings_batch(pool, session)
+    
+    # Batched prediction
     probs, _ = predict_batch_gpu(session.model_state, session.text_embedding, pool_embeds)
     
-    if strategy == "Random":
-        # Fallback to model if available, else true random
-        if session.model_state or session.text_embedding:
-             # If model exists, random strategy usually implies diversity or just random sampling
-             # Let's stick to simple random for diversity
-             selected_indices = random.sample(range(len(pool)), min(BATCH_SIZE, len(pool)))
-        else:
-             selected_indices = random.sample(range(len(pool)), min(BATCH_SIZE, len(pool)))
+    if strategy == "Random" or (session.model_state is None and session.text_embedding is None):
+        selected_indices = random.sample(range(len(pool)), min(BATCH_SIZE, len(pool)))
         session.current_batch_mode = "neutral"
         title = "Random Batch: Select Positive items"
-        
     elif strategy == "Verify Positives":
         sort_idx = np.argsort(probs[:, 1])[::-1]
         selected_indices = sort_idx[:BATCH_SIZE]
         session.current_batch_mode = "verify_pos"
         title = "Verify Positives: Select items that are NOT Positive"
-        
     elif strategy == "Verify Negatives":
         sort_idx = np.argsort(probs[:, 1])
         selected_indices = sort_idx[:BATCH_SIZE]
         session.current_batch_mode = "verify_neg"
         title = "Verify Negatives: Select items that are NOT Negative"
-        
     elif strategy == "Borderline":
         scores = np.abs(probs[:, 1] - 0.5)
         sort_idx = np.argsort(scores)
@@ -277,11 +266,9 @@ def load_next_batch(session: SessionState, strategy: str):
 
     session.current_batch_ids = [pool[i] for i in selected_indices]
     
-    # Prepare Gallery
     images = []
     for idx in session.current_batch_ids:
         img = data_source.get_image(idx)
-        # Find prob
         p_idx = pool.index(idx)
         conf = probs[p_idx][1]
         images.append((img, f"#{idx} ({conf:.0%})"))
@@ -292,25 +279,19 @@ def on_submit_click(session, gallery_selected):
     if not session.current_batch_ids:
         return session, [], "Load batch first", 0, 0
     
-    # Save Undo
     session.save_snapshot()
-    
-    selected_indices = []
-    if gallery_selected:
-        selected_indices = [int(x) for x in gallery_selected]
+    selected_indices = [int(x) for x in gallery_selected] if gallery_selected else []
     
     ids_to_remove = []
     for i, global_id in enumerate(session.current_batch_ids):
         is_selected = i in selected_indices
         label = 0
-        
         if session.current_batch_mode == 'verify_pos':
             label = 0 if is_selected else 1
         elif session.current_batch_mode == 'verify_neg':
             label = 1 if is_selected else 0
         else: # Neutral
             label = 1 if is_selected else 0
-            
         session.labeled[global_id] = label
         ids_to_remove.append(global_id)
         
@@ -318,51 +299,40 @@ def on_submit_click(session, gallery_selected):
         if gid in session.unlabeled:
             session.unlabeled.remove(gid)
             
-    # Train
-    for gid in session.labeled:
-        get_embedding_safe(gid, session)
-        
+    # Batched training (training is always batched internally)
     model_state, loss = train_step_gpu(session.model_state, session.labeled, session.embed_cache)
     session.model_state = model_state
     
-    status = f"Trained! Loss: {loss:.4f}"
-    
-    return session, [], status, len(session.labeled), len(session.unlabeled)
+    return session, [], f"Trained! Loss: {loss:.4f}", len(session.labeled), len(session.unlabeled)
 
 def on_undo_click(session):
     success = session.restore_snapshot()
     msg = "Undo successful" if success else "Nothing to undo"
     return session, msg, len(session.labeled), len(session.unlabeled)
 
+def on_load_click(session, strategy):
+    session, images, title = load_next_batch(session, strategy)
+    return session, images, title
+
 def render_review_tab(session):
-    # Group by label
     pos_ids = [i for i, l in session.labeled.items() if l == 1]
     neg_ids = [i for i, l in session.labeled.items() if l == 0]
-    
     pos_imgs = [(data_source.get_image(i), f"#{i}") for i in pos_ids]
     neg_imgs = [(data_source.get_image(i), f"#{i}") for i in neg_ids]
-    
     return pos_imgs, neg_imgs
 
 def render_autolabel_tab(session):
-    # Predict on a chunk of unlabeled
-    pool = session.unlabeled[:200] # Limit for display
+    pool = session.unlabeled[:200]
     if not pool: return []
-    
-    embeds = [get_embedding_safe(i, session) for i in pool]
+    # Batched embedding & prediction
+    embeds = get_embeddings_batch(pool, session)
     probs, preds = predict_batch_gpu(session.model_state, session.text_embedding, embeds)
     
-    # Sort by conf descending
     results = []
     for i, idx in enumerate(pool):
-        results.append({
-            "id": idx,
-            "conf": probs[i][1],
-            "pred": preds[i]
-        })
+        results.append({"id": idx, "conf": probs[i][1], "pred": preds[i]})
     results.sort(key=lambda x: x["conf"], reverse=True)
     
-    # Format for gallery
     out = []
     for item in results:
         img = data_source.get_image(item["id"])
@@ -371,7 +341,7 @@ def render_autolabel_tab(session):
     return out
 
 def export_json(session):
-    data = [{"filename": f"celeba_{k}.png", "label": v} for k, v in session.labeled.items()]
+    data = [{"id": k, "label": v} for k, v in session.labeled.items()]
     file_path = "/tmp/labels.json"
     with open(file_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -381,40 +351,31 @@ def export_json(session):
 
 with gr.Blocks(title="FastLabel ZeroGPU") as demo:
     session = gr.State(init_app)
-    
     gr.Markdown("# FastLabel on ZeroGPU (Multi-modal Active Learning)")
     
     with gr.Tabs():
-        # --- TAB 1: LABELING ---
         with gr.Tab("Labeling"):
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.Markdown("### 1. Zero-shot Init")
-                    txt_query = gr.Textbox(placeholder="e.g. 'wearing hat'", label="Text Query")
+                    txt_query = gr.Textbox(placeholder="e.g. 'smiling'", label="Text Query")
                     btn_query = gr.Button("Set Query")
-                    
                     gr.Markdown("### 2. Strategy")
                     strategy_drop = gr.Dropdown(
                         choices=["Random", "Verify Positives", "Verify Negatives", "Borderline"], 
                         value="Random", show_label=False
                     )
                     btn_load = gr.Button("Load Batch", variant="primary")
-                    
                     gr.Markdown("### 3. Actions")
                     btn_undo = gr.Button("Undo Last", variant="secondary")
-                    
                     gr.Markdown("### Stats")
                     lbl_count = gr.Number(value=0, label="Labeled")
                     unlbl_count = gr.Number(value=2000, label="Unlabeled")
-                    
                 with gr.Column(scale=3):
                     info_box = gr.Markdown("### Ready. Set a query or just Load Batch.")
-                    gallery = gr.Gallery(
-                        label="Batch", show_label=False, columns=6, height="auto", allow_preview=False
-                    )
+                    gallery = gr.Gallery(label="Batch", show_label=False, columns=6, height="auto", allow_preview=False, type="index")
                     btn_submit = gr.Button("Confirm & Train", variant="stop")
 
-        # --- TAB 2: REVIEW ---
         with gr.Tab("Review"):
             btn_refresh_review = gr.Button("Refresh Review")
             gr.Markdown("#### Positive")
@@ -422,56 +383,23 @@ with gr.Blocks(title="FastLabel ZeroGPU") as demo:
             gr.Markdown("#### Negative")
             gallery_neg = gr.Gallery(show_label=False, columns=8, height="auto")
 
-        # --- TAB 3: AUTOLABEL ---
         with gr.Tab("Autolabel (AI)"):
             btn_refresh_auto = gr.Button("Run Inference on Unlabeled Pool")
             gr.Markdown("Showing top 200 predictions sorted by confidence.")
             gallery_auto = gr.Gallery(show_label=False, columns=8, height="auto")
 
-        # --- TAB 4: EXPORT ---
         with gr.Tab("Export"):
             btn_export = gr.Button("Generate JSON")
             file_output = gr.File(label="Download Labels")
 
     # --- Wiring ---
-    
     btn_query.click(on_set_query, [session, txt_query], [session, info_box])
-    
-    btn_load.click(
-        on_load_click, 
-        [session, strategy_drop], 
-        [session, gallery, info_box]
-    )
-    
-    btn_submit.click(
-        on_submit_click,
-        [session, gallery],
-        [session, gallery, info_box, lbl_count, unlbl_count]
-    )
-    
-    btn_undo.click(
-        on_undo_click,
-        [session],
-        [session, info_box, lbl_count, unlbl_count]
-    )
-    
-    btn_refresh_review.click(
-        render_review_tab,
-        [session],
-        [gallery_pos, gallery_neg]
-    )
-    
-    btn_refresh_auto.click(
-        render_autolabel_tab,
-        [session],
-        [gallery_auto]
-    )
-    
-    btn_export.click(
-        export_json,
-        [session],
-        [file_output]
-    )
+    btn_load.click(on_load_click, [session, strategy_drop], [session, gallery, info_box])
+    btn_submit.click(on_submit_click, [session, gallery], [session, gallery, info_box, lbl_count, unlbl_count])
+    btn_undo.click(on_undo_click, [session], [session, info_box, lbl_count, unlbl_count])
+    btn_refresh_review.click(render_review_tab, [session], [gallery_pos, gallery_neg])
+    btn_refresh_auto.click(render_autolabel_tab, [session], [gallery_auto])
+    btn_export.click(export_json, [session], [file_output])
 
 if __name__ == "__main__":
     demo.launch()
