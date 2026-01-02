@@ -153,6 +153,14 @@
         <option value="easy_neg">Verify Negatives (Easy)</option>
     </select>
     
+    <label for="batch-size">Size:</label>
+    <select id="batch-size">
+        <option value="12">12</option>
+        <option value="24" selected>24</option>
+        <option value="48">48</option>
+        <option value="96">96</option>
+    </select>
+    
     <div class="batch-instruction" id="batch-instruction">
         Load a batch to start.
     </div>
@@ -174,9 +182,10 @@
     async function loadBatch() {
         showLoading(true);
         const strategy = document.getElementById('strategy').value;
+        const batchSize = document.getElementById('batch-size').value;
         
         try {
-            const res = await fetch(`/api/next_batch?strategy=${strategy}`);
+            const res = await fetch(`/api/next_batch?strategy=${strategy}&batch_size=${batchSize}`);
             const data = await res.json();
             
             currentBatch = data.items || []; // items list

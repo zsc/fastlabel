@@ -266,27 +266,34 @@ def index():
 def next_batch():
     load_source_image()
     strategy = request.args.get('strategy', 'random')
+    try:
+        batch_size = int(request.args.get('batch_size', BATCH_SIZE))
+    except ValueError:
+        batch_size = BATCH_SIZE
     
     with app_state.lock:
         if not app_state.unlabeled:
-            return jsonify([])
+            return jsonify({"items": [], "batch_type": "neutral"})
 
         # Fallback if model not ready for model-based strategies
         if app_state.model is None and strategy not in ['random', 'kmeans']:
             strategy = 'random'
             
         if strategy == 'random':
-            ids, batch_type = strategy_random(BATCH_SIZE)
+            ids, batch_type = strategy_random(batch_size)
         elif strategy == 'kmeans':
-            ids, batch_type = strategy_kmeans(BATCH_SIZE)
+            ids, batch_type = strategy_kmeans(batch_size)
         elif strategy == 'borderline':
-            ids, batch_type = strategy_uncertainty(BATCH_SIZE)
+            ids, batch_type = strategy_uncertainty(batch_size)
+            # For borderline, sorting by prob_pos helps group similar levels of uncertainty
         elif strategy == 'easy_pos':
-            ids, batch_type = strategy_verify_pos(BATCH_SIZE)
+            ids, batch_type = strategy_verify_pos(batch_size)
+            # Already sorted by prob_pos descending in strategy
         elif strategy == 'easy_neg':
-            ids, batch_type = strategy_verify_neg(BATCH_SIZE)
+            ids, batch_type = strategy_verify_neg(batch_size)
+            # Already sorted by prob_pos ascending in strategy
         else:
-            ids, batch_type = strategy_random(BATCH_SIZE)
+            ids, batch_type = strategy_random(batch_size)
         
         app_state.current_batch_type = batch_type
         
@@ -307,6 +314,10 @@ def next_batch():
                 "prediction": pred_label,
                 "prob_pos": prob_pos
             })
+            
+        # Optional: Extra sort for 'borderline' to make it easier to look at
+        if strategy == 'borderline':
+            response_data.sort(key=lambda x: x['prob_pos'])
             
     return jsonify({
         "items": response_data,

@@ -52,9 +52,10 @@
 
 ### **API 路由**
 
-1. **`/api/next_batch?strategy=STRATEGY`** - 获取下一批数据：
+1. **`/api/next_batch?strategy=STRATEGY&batch_size=N`** - 获取下一批数据：
+   * 输入：策略名称及可选的批次大小。
    * 输出：`{ "items": [...], "batch_type": "positive/negative/neutral" }`。
-   * 每个 item 包含：`id`, `image` (base64), `prob_pos` (置信度)。
+   * **排序优化**：系统会自动按置信度排序返回数据，以辅助快速视觉扫描。每个 item 包含：`id`, `image` (base64), `prob_pos` (置信度)。
 
 2. **`/api/submit_labels`** - 提交标注结果：
    * 输入：`[{"id": 1, "label": 1}, ...]`。
