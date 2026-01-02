@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FastLabel: CelebA Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f4f9;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        h1 { margin: 0; font-size: 24px; }
+        .stats { font-size: 14px; color: #666; }
+        
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        
+        #grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        
+        .card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        .card img {
+            width: 96px; /* 2x scale */
+            height: 96px;
+            image-rendering: pixelated;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            border: 1px solid #eee;
+        }
+        .meta {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+            width: 100%;
+        }
+        .prediction {
+            font-size: 12px;
+            color: #007bff;
+            font-weight: bold;
+            margin-bottom: 10px;
+            height: 1.5em; /* reserve space */
+        }
+        select {
+            width: 100%;
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            font-size: 18px;
+            color: #666;
+            grid-column: 1 / -1;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>FastLabel Demo (CelebA)</h1>
+    <div class="stats">
+        Labeled: <span id="labeled-count">0</span> | Unlabeled: <span id="unlabeled-count">?</span>
+    </div>
+</header>
+
+<div class="controls">
+    <button id="load-btn" onclick="loadBatch()">Load Next Batch</button>
+    <button id="submit-btn" onclick="submitBatch()" disabled>Submit Labels</button>
+</div>
+
+<div id="grid">
+    <!-- Cards go here -->
+</div>
+<div id="loading" class="loading">Processing...</div>
+
+<script>
+    let currentBatch = [];
+
+    async function loadBatch() {
+        showLoading(true);
+        try {
+            const res = await fetch('/api/next_batch');
+            const data = await res.json();
+            currentBatch = data;
+            renderGrid(data);
+            document.getElementById('submit-btn').disabled = false;
+            document.getElementById('load-btn').disabled = true;
+        } catch (e) {
+            console.error(e);
+            alert("Error loading batch");
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    function renderGrid(data) {
+        const grid = document.getElementById('grid');
+        grid.innerHTML = '';
+        
+        data.forEach(item => {
+            const card = document.createElement('div');
+            card.className = 'card';
+            
+            let predText = "No model yet";
+            if (item.prediction !== null) {
+                predText = `Pred: Class ${item.prediction} (${(item.confidence * 100).toFixed(0)}%)`;
+            }
+            
+            // Generate options
+            let options = '<option value="">Select Label...</option>';
+            for (let i = 0; i < 10; i++) {
+                // Pre-select if prediction is high confidence? Maybe not for active learning.
+                options += `<option value="${i}">Class ${i}</option>`;
+            }
+
+            card.innerHTML = `
+                <img src="data:image/png;base64,${item.image}" alt="Img ${item.id}">
+                <div class="meta">ID: ${item.id}</div>
+                <div class="prediction">${predText}</div>
+                <select id="sel-${item.id}">
+                    ${options}
+                </select>
+            `;
+            grid.appendChild(card);
+        });
+    }
+
+    async function submitBatch() {
+        const labels = [];
+        let missing = false;
+        
+        currentBatch.forEach(item => {
+            const sel = document.getElementById(`sel-${item.id}`);
+            const val = sel.value;
+            if (val === "") {
+                // It's allowed to skip labels in AL usually, but for this demo let's force or just ignore
+                // Let's ignore skipped ones but ensure at least one is submitted?
+                // Spec says "User chooses a label".
+            } else {
+                labels.push({ id: item.id, label: val });
+            }
+        });
+
+        if (labels.length === 0) {
+            alert("Please label at least one image.");
+            return;
+        }
+
+        showLoading(true);
+        try {
+            const res = await fetch('/api/submit_labels', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(labels)
+            });
+            const result = await res.json();
+            
+            if (result.success) {
+                document.getElementById('labeled-count').innerText = result.labeled_count;
+                document.getElementById('unlabeled-count').innerText = result.unlabeled_count;
+                
+                // Automatically load next batch
+                await loadBatch();
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Error submitting labels");
+            showLoading(false); // only hide if error, otherwise loadBatch handles it
+        }
+    }
+
+    function showLoading(show) {
+        document.getElementById('loading').style.display = show ? 'block' : 'none';
+        if (show) {
+            document.getElementById('grid').style.opacity = '0.5';
+        } else {
+            document.getElementById('grid').style.opacity = '1';
+        }
+    }
+    
+    // Initial load
+    window.onload = loadBatch;
+
+</script>
+
+</body>
+</html>
