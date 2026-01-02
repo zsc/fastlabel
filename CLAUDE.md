@@ -57,19 +57,27 @@
    * 输入：`{ "query": "text description" }`。
    * 作用：计算 CLIP 文本嵌入，用于在无监督模型时的 Zero-shot 预测。
 
-2. **`/api/next_batch?strategy=STRATEGY&batch_size=N`** - 获取下一批数据：
-   * 输入：策略名称及可选的批次大小。
-   * 输出：`{ "items": [...], "batch_type": "positive/negative/neutral" }`。
-   * **排序优化**：系统会自动按置信度排序返回数据，以辅助快速视觉扫描。每个 item 包含：`id`, `image` (base64), `prob_pos` (置信度)。
+2. **`/api/next_batch`** - 获取下一批数据 (支持 `strategy` 和 `batch_size`)。
 
-2. **`/api/submit_labels`** - 提交标注结果：
-   * 输入：`[{"id": 1, "label": 1}, ...]`。
-   * 逻辑：更新内存状态 -> 触发 `train_step()`。
+3. **`/api/image/<int:id>`** - 获取单张图片原始数据：
+   * 输出：PNG 图片流。
+   * 作用：支持前端 `<img>` 标签直接高效加载，便于高密度预览。
+
+4. **`/api/labeled_data`** - 获取所有已标注数据：
+   * 输出：按标签分组的 ID 列表 `{ "1": [id...], "0": [id...] }`。
+
+5. **`/api/submit_labels`** - 提交标注结果。
 
 ## 5. **前端：用户交互**
 
 ### **界面规范**
 
+* **双 Tab 视图**：
+  * **Labeling**：核心标注界面。
+  * **Review All**：全量已标数据预览。
+* **Review 视图**：
+  * 按“正例/负例”分块展示。
+  * **极高密度**：无间隙网格，仅展示图片（48x48），利用浏览器懒加载 (`loading="lazy"`) 优化性能。
 * **视觉反馈**：
   * 正例（Positive）：**绿色边框**。
   * 负例（Negative）：**红色边框** + 半透明（去强调）。

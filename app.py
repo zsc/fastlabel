@@ -16,7 +16,7 @@ import torch.optim as optim
 import open_clip
 from sklearn.cluster import KMeans
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 
 # --- Configuration ---
 CELEBA_URL = "https://zsc.github.io/widgets/celeba/48x48.png"
@@ -400,6 +400,25 @@ def submit_labels():
         "labeled_count": len(app_state.labeled),
         "unlabeled_count": len(app_state.unlabeled)
     })
+
+@app.route('/api/image/<int:idx>')
+def get_image(idx):
+    load_source_image() # ensure loaded
+    img = get_image_crop(idx)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png')
+
+@app.route('/api/labeled_data')
+def get_labeled_data():
+    grouped = {}
+    with app_state.lock:
+        for idx, label in app_state.labeled.items():
+            if label not in grouped:
+                grouped[label] = []
+            grouped[label].append(idx)
+    return jsonify(grouped)
 
 if __name__ == '__main__':
     load_source_image()

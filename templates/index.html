@@ -35,6 +35,28 @@
         h1 { margin: 0; font-size: 24px; }
         .stats { font-size: 14px; color: #666; }
         
+        .tabs {
+            margin-bottom: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        .tab-btn {
+            padding: 10px 20px;
+            background: none;
+            border: none;
+            border-bottom: 3px solid transparent;
+            font-size: 16px;
+            cursor: pointer;
+            color: #666;
+        }
+        .tab-btn.active {
+            border-bottom-color: #007bff;
+            color: #007bff;
+            font-weight: bold;
+        }
+
+        .view-section { display: none; }
+        .view-section.active { display: block; }
+
         .controls {
             margin-bottom: 20px;
             display: flex;
@@ -68,10 +90,37 @@
             font-size: 16px;
         }
 
+        /* Labeling Grid */
         #grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
             gap: 10px;
+        }
+        
+        /* Review Grid - High Density */
+        .review-group {
+            margin-bottom: 30px;
+        }
+        .review-group h3 {
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 2px solid #ddd;
+        }
+        .review-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px; /* Very tight gap */
+        }
+        .review-item {
+            width: 48px;
+            height: 48px;
+            position: relative;
+        }
+        .review-item img {
+            width: 100%;
+            height: 100%;
+            display: block;
+            image-rendering: pixelated;
         }
         
         .card {
@@ -108,9 +157,6 @@
         .card.is-positive { border-color: var(--card-pos); }
         .card.is-negative { border-color: var(--card-neg); opacity: 0.6; } /* Dim negatives to de-emphasize */
 
-        /* In 'Verify Positive' mode, maybe we highlight negatives differently? */
-        /* Let's stick to Green=Pos, Red=Neg */
-
         .loading {
             text-align: center;
             padding: 40px;
@@ -143,47 +189,75 @@
     </div>
 </header>
 
-<div class="controls">
-    <label for="strategy">Strategy:</label>
-    <select id="strategy">
-        <option value="random">Random (Cold Start)</option>
-        <option value="kmeans">K-Means (Diversity)</option>
-        <option value="borderline">Borderline (Uncertainty)</option>
-        <option value="easy_pos">Verify Positives (Easy)</option>
-        <option value="easy_neg">Verify Negatives (Easy)</option>
-    </select>
-    
-    <label for="batch-size">Size:</label>
-    <select id="batch-size">
-        <option value="12">12</option>
-        <option value="24" selected>24</option>
-        <option value="48">48</option>
-        <option value="96">96</option>
-    </select>
-    
-    <div class="batch-instruction" id="batch-instruction">
-        Load a batch to start.
-    </div>
-    
-    <div style="display:flex; gap:5px;">
-        <input type="text" id="text-query" placeholder="Initial Text Query (Zero-shot)" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
-        <button onclick="setQuery()" style="padding: 10px;">Set</button>
-    </div>
-
-    <button id="load-btn" onclick="loadBatch()">Load Batch</button>
-    <button id="submit-btn" class="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
+<div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('labeling')">Labeling</button>
+    <button class="tab-btn" onclick="switchTab('review')">Review All</button>
 </div>
 
-<div id="grid"></div>
+<!-- Labeling View -->
+<div id="view-labeling" class="view-section active">
+    <div class="controls">
+        <label for="strategy">Strategy:</label>
+        <select id="strategy">
+            <option value="random">Random (Cold Start)</option>
+            <option value="kmeans">K-Means (Diversity)</option>
+            <option value="borderline">Borderline (Uncertainty)</option>
+            <option value="easy_pos">Verify Positives (Easy)</option>
+            <option value="easy_neg">Verify Negatives (Easy)</option>
+        </select>
+        
+        <label for="batch-size">Size:</label>
+        <select id="batch-size">
+            <option value="12">12</option>
+            <option value="24" selected>24</option>
+            <option value="48">48</option>
+            <option value="96">96</option>
+        </select>
+        
+        <div class="batch-instruction" id="batch-instruction">
+            Load a batch to start.
+        </div>
+        
+        <div style="display:flex; gap:5px;">
+            <input type="text" id="text-query" placeholder="Initial Text Query (Zero-shot)" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+            <button onclick="setQuery()" style="padding: 10px;">Set</button>
+        </div>
+
+        <button id="load-btn" onclick="loadBatch()">Load Batch</button>
+        <button id="submit-btn" class="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
+    </div>
+
+    <div id="grid"></div>
+</div>
+
+<!-- Review View -->
+<div id="view-review" class="view-section">
+    <div id="review-content">
+        <!-- Loaded dynamically -->
+    </div>
+</div>
+
 <div id="loading" class="loading">Processing & Training...</div>
 
 <script>
     let currentBatch = [];
     let currentBatchType = "neutral"; // neutral, positive, negative
-
-    // Helper: Map ID to current label state (1=Pos, 0=Neg)
     let labelState = {}; 
-    
+
+    function switchTab(tabName) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active'));
+        
+        if (tabName === 'labeling') {
+            document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+            document.getElementById('view-labeling').classList.add('active');
+        } else {
+            document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+            document.getElementById('view-review').classList.add('active');
+            loadReviewData();
+        }
+    }
+
     async function setQuery() {
         const query = document.getElementById('text-query').value;
         showLoading(true);
@@ -211,14 +285,13 @@
             const res = await fetch(`/api/next_batch?strategy=${strategy}&batch_size=${batchSize}`);
             const data = await res.json();
             
-            currentBatch = data.items || []; // items list
+            currentBatch = data.items || [];
             currentBatchType = data.batch_type || "neutral";
             
             updateUIForBatchType();
             renderGrid();
             
             document.getElementById('submit-btn').disabled = false;
-            // document.getElementById('load-btn').disabled = true; // Can allow reload if wanted
         } catch (e) {
             console.error(e);
             alert("Error loading batch");
@@ -237,21 +310,14 @@
         if (currentBatchType === 'positive') {
             body.classList.add('mode-positive');
             instr.innerText = "Verify Positives: Click images that are NOT Positive.";
-            // Default all to Positive (1)
             currentBatch.forEach(item => labelState[item.id] = 1);
         } else if (currentBatchType === 'negative') {
             body.classList.add('mode-negative');
             instr.innerText = "Verify Negatives: Click images that are NOT Negative.";
-            // Default all to Negative (0)
             currentBatch.forEach(item => labelState[item.id] = 0);
         } else {
-            // Neutral/Mixed
             instr.innerText = "Label Mixed Batch: Click to toggle (Green=Pos, Red=Neg).";
-            // Default: Use model prediction if available, else 0? 
-            // Better: Default to 0 (Negative) as base state? Or explicit unknown?
-            // For binary UI speed, let's default to prediction or 0.
             currentBatch.forEach(item => {
-                // If model predicted, use it. Else 0.
                 labelState[item.id] = (item.prediction === 1) ? 1 : 0;
             });
         }
@@ -263,11 +329,8 @@
         
         currentBatch.forEach(item => {
             const card = document.createElement('div');
-            
-            // Build initial class
             updateCardClass(card, labelState[item.id]);
             
-            // Confidence display
             let confStr = "";
             if (item.prob_pos !== undefined) {
                 confStr = (item.prob_pos * 100).toFixed(0) + "% Pos";
@@ -287,7 +350,7 @@
     }
 
     function updateCardClass(cardElement, label) {
-        cardElement.className = 'card'; // reset
+        cardElement.className = 'card'; 
         if (label === 1) {
             cardElement.classList.add('is-positive');
         } else {
@@ -296,15 +359,12 @@
     }
 
     function toggleLabel(id, cardElement) {
-        // Flip label
         labelState[id] = labelState[id] === 1 ? 0 : 1;
         updateCardClass(cardElement, labelState[id]);
     }
 
     async function submitBatch() {
         const labels = [];
-        
-        // Collect from labelState
         for (const [id, lbl] of Object.entries(labelState)) {
             labels.push({ id: parseInt(id), label: lbl });
         }
@@ -323,8 +383,6 @@
             if (result.success) {
                 document.getElementById('labeled-count').innerText = result.labeled_count;
                 document.getElementById('unlabeled-count').innerText = result.unlabeled_count;
-                
-                // Auto load next batch
                 await loadBatch();
             }
         } catch (e) {
@@ -333,15 +391,64 @@
             showLoading(false);
         }
     }
+    
+    // --- Review Tab Logic ---
+    
+    async function loadReviewData() {
+        const container = document.getElementById('review-content');
+        container.innerHTML = '<div style="padding:20px;">Loading...</div>';
+        
+        try {
+            const res = await fetch('/api/labeled_data');
+            const data = await res.json();
+            
+            container.innerHTML = '';
+            
+            // Labels to sort? 1 (Positive) then 0 (Negative) usually
+            const labels = Object.keys(data).sort((a,b) => b - a);
+            
+            labels.forEach(lbl => {
+                const ids = data[lbl];
+                const group = document.createElement('div');
+                group.className = 'review-group';
+                
+                const labelName = lbl === "1" ? "Positive" : "Negative";
+                const color = lbl === "1" ? "green" : "red";
+                
+                group.innerHTML = `<h3 style="color:${color}">${labelName} (${ids.length})</h3>`;
+                
+                const grid = document.createElement('div');
+                grid.className = 'review-grid';
+                
+                // Show max 500 per group to avoid browser crash in demo? Or infinite scroll?
+                // Let's just show all for now as per "preview all" request, assuming < few thousands
+                ids.forEach(id => {
+                    const item = document.createElement('div');
+                    item.className = 'review-item';
+                    // Lazy load logic could be added here (loading="lazy")
+                    item.innerHTML = `<img src="/api/image/${id}" loading="lazy" title="#${id}">`;
+                    grid.appendChild(item);
+                });
+                
+                group.appendChild(grid);
+                container.appendChild(group);
+            });
+            
+            if (labels.length === 0) {
+                container.innerHTML = '<div style="padding:20px;">No labeled data yet.</div>';
+            }
+            
+        } catch (e) {
+            console.error(e);
+            container.innerHTML = 'Error loading data.';
+        }
+    }
 
     function showLoading(show) {
         document.getElementById('loading').style.display = show ? 'block' : 'none';
         const grid = document.getElementById('grid');
         if (grid) grid.style.opacity = show ? '0.3' : '1';
     }
-    
-    // Initial load? Let user click.
-    // window.onload = loadBatch; 
 </script>
 
 </body>
