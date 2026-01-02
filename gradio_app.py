@@ -243,23 +243,26 @@ def load_next_batch(session: SessionState, strategy: str):
     if strategy == "Random" or (session.model_state is None and session.text_embedding is None):
         selected_indices = random.sample(range(len(pool)), min(BATCH_SIZE, len(pool)))
         session.current_batch_mode = "neutral"
-        title = "Random Batch: Select Positive items"
+        title = "### 🟢 Mode: MIXED\n**Action**: Select all **POSITIVE** items. (Unselected will be Negative)"
+        
     elif strategy == "Verify Positives":
         sort_idx = np.argsort(probs[:, 1])[::-1]
         selected_indices = sort_idx[:BATCH_SIZE]
         session.current_batch_mode = "verify_pos"
-        title = "Verify Positives: Select items that are NOT Positive"
+        title = "### 🔵 Mode: VERIFY POSITIVES\n**Action**: Select the **ERRORS** (items that are actually **Negative**). (Unselected will stay Positive)"
+        
     elif strategy == "Verify Negatives":
         sort_idx = np.argsort(probs[:, 1])
         selected_indices = sort_idx[:BATCH_SIZE]
         session.current_batch_mode = "verify_neg"
-        title = "Verify Negatives: Select items that are NOT Negative"
+        title = "### 🔴 Mode: VERIFY NEGATIVES\n**Action**: Select the **ERRORS** (items that are actually **Positive**). (Unselected will stay Negative)"
+        
     elif strategy == "Borderline":
         scores = np.abs(probs[:, 1] - 0.5)
         sort_idx = np.argsort(scores)
         selected_indices = sort_idx[:BATCH_SIZE]
         session.current_batch_mode = "neutral"
-        title = "Uncertainty Batch: Select Positive items"
+        title = "### 🟡 Mode: BORDERLINE\n**Action**: Select all **POSITIVE** items. (Unselected will be Negative)"
     else:
         selected_indices = []
         title = "Unknown Strategy"
