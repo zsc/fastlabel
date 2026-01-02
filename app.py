@@ -365,9 +365,16 @@ def next_batch():
                 "prob_pos": prob_pos
             })
             
-        # Optional: Extra sort for 'borderline' to make it easier to look at
-        if strategy == 'borderline':
+        # Always sort response_data by confidence to help rapid labeling
+        if app_state.current_batch_type == "positive":
+            # Show highest confidence first
+            response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
+        elif app_state.current_batch_type == "negative":
+            # Show most likely negatives first (lowest prob_pos)
             response_data.sort(key=lambda x: x['prob_pos'])
+        else:
+            # Neutral/Mixed: Sort by confidence descending to group predictions
+            response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
             
     return jsonify({
         "items": response_data,
