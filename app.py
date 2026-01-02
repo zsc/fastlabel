@@ -56,6 +56,10 @@ class State:
     lock: threading.Lock = field(default_factory=threading.Lock)
     source_image: Optional[Image.Image] = None
     
+    # Text Query State
+    text_query: Optional[str] = None
+    text_embedding: Optional[torch.Tensor] = None
+    
     # Track current batch context to know what the user was verifying
     current_batch_type: str = "neutral" # neutral, positive, negative
 
@@ -111,6 +115,7 @@ print(f"Initializing CLIP model on {DEVICE}...")
 clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
 clip_model = clip_model.to(DEVICE)
 clip_model.eval()
+tokenizer = open_clip.get_tokenizer('ViT-B-32')
 print("CLIP initialized.")
 
 def get_embedding(idx: int) -> np.ndarray:
@@ -165,20 +170,45 @@ def train_step():
 
 def predict_batch(ids: List[int]) -> Tuple[np.ndarray, np.ndarray]:
     """Returns (probs, predictions) for a list of IDs."""
-    if app_state.model is None:
-        # Uniform probability if no model
-        return np.ones((len(ids), NUM_CLASSES)) / NUM_CLASSES, np.zeros(len(ids))
     
-    embeddings = [get_embedding(i) for i in ids]
-    X = torch.tensor(np.array(embeddings), dtype=torch.float32).to(DEVICE)
-    
-    app_state.model.eval()
-    with torch.no_grad():
-        outputs = app_state.model(X)
-        probs = torch.softmax(outputs, dim=1) # (N, 2)
-        _, preds = torch.max(probs, 1)
+    # Case 1: Active Learning Model (Highest Priority)
+    if app_state.model is not None:
+        embeddings = [get_embedding(i) for i in ids]
+        X = torch.tensor(np.array(embeddings), dtype=torch.float32).to(DEVICE)
         
-    return probs.cpu().numpy(), preds.cpu().numpy()
+        app_state.model.eval()
+        with torch.no_grad():
+            outputs = app_state.model(X)
+            probs = torch.softmax(outputs, dim=1) # (N, 2)
+            _, preds = torch.max(probs, 1)
+        return probs.cpu().numpy(), preds.cpu().numpy()
+
+    # Case 2: Zero-shot Text Query
+    if app_state.text_embedding is not None:
+        embeddings_list = [get_embedding(i) for i in ids]
+        embeddings_arr = np.array(embeddings_list)
+        img_feats = torch.tensor(embeddings_arr).to(DEVICE)
+        text_feat = app_state.text_embedding.to(DEVICE) # (1, D)
+        
+        with torch.no_grad():
+            # Cosine similarity
+            sim = (img_feats @ text_feat.T).squeeze(1) # [N]
+            
+            # Simple scaling logic
+            logits = sim * 100.0
+            probs_pos = torch.sigmoid(logits)
+            
+            # Construct (N, 2) probs
+            probs = torch.zeros((len(ids), 2), device=DEVICE)
+            probs[:, 1] = probs_pos
+            probs[:, 0] = 1 - probs_pos
+            
+            preds = (probs_pos > 0.5).long()
+            
+        return probs.cpu().numpy(), preds.cpu().numpy()
+
+    # Case 3: Random / Uninitialized
+    return np.ones((len(ids), NUM_CLASSES)) / NUM_CLASSES, np.zeros(len(ids))
 
 # --- Strategies ---
 
@@ -261,6 +291,26 @@ app = Flask(__name__)
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/api/set_query', methods=['POST'])
+def set_query():
+    data = request.json
+    query = data.get('query', '').strip()
+    
+    with app_state.lock:
+        if not query:
+            app_state.text_query = None
+            app_state.text_embedding = None
+        else:
+            app_state.text_query = query
+            print(f"Processing text query: {query}")
+            with torch.no_grad():
+                text_tokens = tokenizer([query]).to(DEVICE)
+                text_features = clip_model.encode_text(text_tokens)
+                text_features /= text_features.norm(dim=-1, keepdim=True)
+                app_state.text_embedding = text_features # (1, 512)
+                
+    return jsonify({"success": True, "query": app_state.text_query})
 
 @app.route('/api/next_batch')
 def next_batch():

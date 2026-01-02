@@ -40,19 +40,24 @@
 4. **即时反馈**：
    训练完成后，下一批数据的预测置信度将基于最新模型实时更新。
 
-### **主动学习策略**
+### 主动学习策略
 
-* **Random**：随机采样，用于冷启动。
+* **Zero-shot Text Init**：输入文本（如 "smiling woman"），系统利用 CLIP 计算文本-图像相似度作为初始分数。结合 "Verify Positives" 策略，可实现无冷启动的快速筛选。
+* **Random**：随机采样，用于冷启动（无文本输入时）。
 * **K-Means (Diversity)**：通过特征空间聚类，选择各簇中心样本，确保数据多样性。
 * **Borderline (Uncertainty)**：选择预测概率接近 0.5 的样本（模型最困惑的边界）。
-* **Verify Positives (Easy Positives)**：选择预测概率最高的样本进行快速批量确认。
+* **Verify Positives (Easy Positives)**：选择预测概率最高的样本进行快速批量确认（支持 Text Init 结果）。
 * **Verify Negatives (Easy Negatives)**：选择预测概率最低的样本进行快速批量确认。
 
 ## 4. **后端：功能实现与 API**
 
 ### **API 路由**
 
-1. **`/api/next_batch?strategy=STRATEGY&batch_size=N`** - 获取下一批数据：
+1. **`/api/set_query`** - 设置初始文本查询：
+   * 输入：`{ "query": "text description" }`。
+   * 作用：计算 CLIP 文本嵌入，用于在无监督模型时的 Zero-shot 预测。
+
+2. **`/api/next_batch?strategy=STRATEGY&batch_size=N`** - 获取下一批数据：
    * 输入：策略名称及可选的批次大小。
    * 输出：`{ "items": [...], "batch_type": "positive/negative/neutral" }`。
    * **排序优化**：系统会自动按置信度排序返回数据，以辅助快速视觉扫描。每个 item 包含：`id`, `image` (base64), `prob_pos` (置信度)。

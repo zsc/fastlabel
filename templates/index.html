@@ -164,6 +164,11 @@
     <div class="batch-instruction" id="batch-instruction">
         Load a batch to start.
     </div>
+    
+    <div style="display:flex; gap:5px;">
+        <input type="text" id="text-query" placeholder="Initial Text Query (Zero-shot)" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+        <button onclick="setQuery()" style="padding: 10px;">Set</button>
+    </div>
 
     <button id="load-btn" onclick="loadBatch()">Load Batch</button>
     <button id="submit-btn" class="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
@@ -178,6 +183,24 @@
 
     // Helper: Map ID to current label state (1=Pos, 0=Neg)
     let labelState = {}; 
+    
+    async function setQuery() {
+        const query = document.getElementById('text-query').value;
+        showLoading(true);
+        try {
+            await fetch('/api/set_query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: query })
+            });
+            alert("Query set! Now use 'Verify Positives' strategy.");
+        } catch (e) {
+            console.error(e);
+            alert("Error setting query");
+        } finally {
+            showLoading(false);
+        }
+    }
 
     async function loadBatch() {
         showLoading(true);
