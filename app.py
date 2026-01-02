@@ -3,9 +3,9 @@ import io
 import json
 import random
 import threading
-import requests
 import base64
 import numpy as np
+import glob
 from PIL import Image
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -15,19 +15,19 @@ import torch.nn as nn
 import torch.optim as optim
 import open_clip
 from sklearn.cluster import KMeans
-
 from flask import Flask, render_template, request, jsonify, send_file
 
-# --- Configuration ---
-CELEBA_URL = "https://zsc.github.io/widgets/celeba/48x48.png"
-IMAGE_FILENAME = "celeba_48x48.png"
-TILE_SIZE = 48
-COLS = 200
-ROWS = 150
-TOTAL_IMAGES = COLS * ROWS
-BATCH_SIZE = 24  # Increased for higher density
-NUM_CLASSES = 2 # Binary: 0 (Negative), 1 (Positive)
+# For Audio Processing
+import librosa
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# --- Configuration & Constants ---
+BATCH_SIZE_DEFAULT = 24
+NUM_CLASSES = 2 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+PORT = 8008
 
 # --- Model Definitions ---
 
@@ -37,93 +37,127 @@ class MLPHead(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            # nn.Dropout(0.2),
             nn.Linear(512, num_classes)
         )
 
     def forward(self, x):
         return self.fc(x)
 
+# --- Audio Processing ---
+
+class AudioProcessor:
+    @staticmethod
+    def generate_mel_spectrogram(audio_path: str) -> Image.Image:
+        """Converts audio file to a PIL Image of its Mel-Spectrogram."""
+        y, sr = librosa.load(audio_path, sr=None)
+        
+        # Calculate Mel Spectrogram
+        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmax=8000)
+        S_dB = librosa.power_to_db(S, ref=np.max)
+        
+        # Plotting to buffer
+        fig, ax = plt.subplots(figsize=(3, 3), dpi=100)
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
+        plt.margins(0,0)
+        
+        # Use a high-contrast colormap
+        librosa.display.specshow(S_dB, sr=sr, fmax=8000, ax=ax, cmap='magma')
+        
+        ax.axis('off')
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
+        buf.seek(0)
+        return Image.open(buf).convert('RGB')
+
+# --- DataSource Abstraction ---
+
+class DataSource:
+    def __init__(self, data_type: str, root_path: str):
+        self.data_type = data_type # 'image' or 'audio'
+        self.root_path = root_path
+        self.file_list: List[str] = []
+        self.scan_files()
+        
+        # Cache for spectrograms or processed images
+        self.image_cache: Dict[int, Image.Image] = {}
+
+    def scan_files(self):
+        if not os.path.exists(self.root_path):
+            self.file_list = []
+            return
+            
+        extensions = ['*.png', '*.jpg', '*.jpeg'] if self.data_type == 'image' else ['*.wav', '*.mp3', '*.flac']
+        files = []
+        for ext in extensions:
+            files.extend(glob.glob(os.path.join(self.root_path, ext)))
+            files.extend(glob.glob(os.path.join(self.root_path, ext.upper())))
+        
+        self.file_list = sorted(files)
+        print(f"Scanned {len(self.file_list)} {self.data_type} files.")
+
+    def get_image(self, idx: int) -> Image.Image:
+        if idx in self.image_cache:
+            return self.image_cache[idx]
+        
+        path = self.file_list[idx]
+        if self.data_type == 'image':
+            img = Image.open(path).convert('RGB')
+        else:
+            # Generate Mel Spectrogram
+            img = AudioProcessor.generate_mel_spectrogram(path)
+            # Resize for CLIP consistency if needed, though CLIP preprocess handles it
+            img = img.resize((224, 224))
+            
+        self.image_cache[idx] = img
+        return img
+
+    def get_audio_path(self, idx: int) -> str:
+        if self.data_type == 'audio':
+            return self.file_list[idx]
+        raise ValueError("Not in audio mode")
+
 # --- State Management ---
 
 @dataclass
 class State:
-    labeled: Dict[int, int] = field(default_factory=dict)
-    unlabeled: List[int] = field(default_factory=list)
+    data_source: Optional[DataSource] = None
+    labeled: Dict[int, int] = field(default_factory=dict) # Index -> Label
+    unlabeled: List[int] = field(default_factory=list) # List of indices
     embed_cache: Dict[int, np.ndarray] = field(default_factory=dict)
+    
     model: Optional[MLPHead] = None
     optimizer: Optional[optim.Optimizer] = None
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    source_image: Optional[Image.Image] = None
     
-    # Text Query State
     text_query: Optional[str] = None
     text_embedding: Optional[torch.Tensor] = None
     
-    # Track current batch context to know what the user was verifying
-    current_batch_type: str = "neutral" # neutral, positive, negative
+    current_batch_type: str = "neutral"
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 app_state = State()
 
-# --- Helper Functions ---
-
-def download_image_if_not_exists():
-    if not os.path.exists(IMAGE_FILENAME):
-        print(f"Downloading {IMAGE_FILENAME} from {CELEBA_URL}...")
-        try:
-            response = requests.get(CELEBA_URL, stream=True)
-            response.raise_for_status()
-            with open(IMAGE_FILENAME, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print("Download complete.")
-        except Exception as e:
-            print(f"Error downloading image: {e}")
-            raise e
-
-def load_source_image():
-    if app_state.source_image is None:
-        download_image_if_not_exists()
-        app_state.source_image = Image.open(IMAGE_FILENAME).convert('RGB')
-        # Initialize unlabeled pool
-        app_state.unlabeled = list(range(TOTAL_IMAGES))
-        random.shuffle(app_state.unlabeled)
-
-def get_image_crop(idx: int) -> Image.Image:
-    if app_state.source_image is None:
-        load_source_image()
-    if app_state.source_image is None: # explicit check for mypy/runtime safety
-         raise RuntimeError("Image not loaded")
-    
-    col = idx % COLS
-    row = idx // COLS
-    left = col * TILE_SIZE
-    upper = row * TILE_SIZE
-    right = left + TILE_SIZE
-    lower = upper + TILE_SIZE
-    
-    return app_state.source_image.crop((left, upper, right, lower))
-
-def image_to_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    return base64.b64encode(buf.getvalue()).decode('utf-8')
-
-# --- CLIP & Model Initialization ---
+# --- CLIP Initialization ---
 
 print(f"Initializing CLIP model on {DEVICE}...")
-clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
 clip_model = clip_model.to(DEVICE)
 clip_model.eval()
 tokenizer = open_clip.get_tokenizer('ViT-B-32')
 print("CLIP initialized.")
 
+# --- Helper Functions ---
+
 def get_embedding(idx: int) -> np.ndarray:
     if idx in app_state.embed_cache:
         return app_state.embed_cache[idx]
     
-    img = get_image_crop(idx)
-    img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+    if app_state.data_source is None:
+        raise RuntimeError("No data source configured")
+        
+    img = app_state.data_source.get_image(idx)
+    img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
     
     with torch.no_grad():
         features = clip_model.encode_image(img_tensor)
@@ -143,146 +177,86 @@ def init_mlp_if_needed():
 def train_step():
     if not app_state.labeled:
         return
-
     init_mlp_if_needed()
     if app_state.model is None or app_state.optimizer is None: return
 
     app_state.model.train()
-    
     ids = list(app_state.labeled.keys())
     labels = list(app_state.labeled.values())
-    
-    # Minimal caching for speed, but re-fetching from dict is fast enough
     embeddings = [get_embedding(i) for i in ids]
     
     X = torch.tensor(np.array(embeddings), dtype=torch.float32).to(DEVICE)
     y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
     
-    epochs = 5 
-    for _ in range(epochs):
+    for _ in range(10): # 10 epochs per trigger
         app_state.optimizer.zero_grad()
         outputs = app_state.model(X)
         loss = nn.CrossEntropyLoss()(outputs, y)
         loss.backward()
         app_state.optimizer.step()
-        
-    print(f"Training step complete. Loss: {loss.item():.4f}, Labeled count: {len(ids)}")
+    print(f"Training complete. Loss: {loss.item():.4f}")
 
 def predict_batch(ids: List[int]) -> Tuple[np.ndarray, np.ndarray]:
-    """Returns (probs, predictions) for a list of IDs."""
-    
-    # Case 1: Active Learning Model (Highest Priority)
     if app_state.model is not None:
         embeddings = [get_embedding(i) for i in ids]
         X = torch.tensor(np.array(embeddings), dtype=torch.float32).to(DEVICE)
-        
         app_state.model.eval()
         with torch.no_grad():
             outputs = app_state.model(X)
-            probs = torch.softmax(outputs, dim=1) # (N, 2)
+            probs = torch.softmax(outputs, dim=1)
             _, preds = torch.max(probs, 1)
         return probs.cpu().numpy(), preds.cpu().numpy()
 
-    # Case 2: Zero-shot Text Query
     if app_state.text_embedding is not None:
-        embeddings_list = [get_embedding(i) for i in ids]
-        embeddings_arr = np.array(embeddings_list)
+        embeddings_arr = np.array([get_embedding(i) for i in ids])
         img_feats = torch.tensor(embeddings_arr).to(DEVICE)
-        text_feat = app_state.text_embedding.to(DEVICE) # (1, D)
-        
+        text_feat = app_state.text_embedding.to(DEVICE)
         with torch.no_grad():
-            # Cosine similarity
-            sim = (img_feats @ text_feat.T).squeeze(1) # [N]
-            
-            # Simple scaling logic
+            sim = (img_feats @ text_feat.T).squeeze(1)
             logits = sim * 100.0
             probs_pos = torch.sigmoid(logits)
-            
-            # Construct (N, 2) probs
             probs = torch.zeros((len(ids), 2), device=DEVICE)
             probs[:, 1] = probs_pos
             probs[:, 0] = 1 - probs_pos
-            
             preds = (probs_pos > 0.5).long()
-            
         return probs.cpu().numpy(), preds.cpu().numpy()
 
-    # Case 3: Random / Uninitialized
     return np.ones((len(ids), NUM_CLASSES)) / NUM_CLASSES, np.zeros(len(ids))
 
 # --- Strategies ---
 
-def strategy_random(k: int) -> Tuple[List[int], str]:
-    pool = app_state.unlabeled[:min(len(app_state.unlabeled), 1000)] # sample from top 1000 for speed
-    selected = random.sample(pool, min(k, len(pool)))
-    return selected, "neutral"
+def strategy_random(k: int) -> List[int]:
+    pool = app_state.unlabeled[:min(len(app_state.unlabeled), 1000)]
+    return random.sample(pool, min(k, len(pool)))
 
-def strategy_kmeans(k: int) -> Tuple[List[int], str]:
-    # Cluster a subset of unlabeled data
+def strategy_kmeans(k: int) -> List[int]:
     pool_size = min(len(app_state.unlabeled), 1000)
     pool = app_state.unlabeled[:pool_size]
-    
     embeddings = np.array([get_embedding(i) for i in pool])
-    
-    # We want 'k' items. If k is small, we can just pick k randoms?
-    # Or actually, the prompt says "KMeans Big Class".
-    # Interpretation: Cluster into K clusters, pick center of each?
-    # Or: Cluster into X clusters, pick one whole cluster?
-    # Let's interpret as: Find diversity. Cluster into k, pick centers.
-    
     n_clusters = min(k, pool_size)
     kmeans = KMeans(n_clusters=n_clusters, n_init=5, max_iter=100)
     kmeans.fit(embeddings)
-    
-    # Find closest samples to centers
     selected = []
     for center in kmeans.cluster_centers_:
         dists = np.linalg.norm(embeddings - center, axis=1)
-        idx = np.argmin(dists)
-        selected.append(pool[idx])
-        
-    return selected, "neutral"
+        selected.append(pool[np.argmin(dists)])
+    return selected
 
-def strategy_uncertainty(k: int) -> Tuple[List[int], str]:
-    # Borderline cases: prob close to 0.5
+def strategy_uncertainty(k: int) -> List[int]:
     pool = app_state.unlabeled[:min(len(app_state.unlabeled), 500)]
     probs, _ = predict_batch(pool)
-    
-    # Score = abs(prob_pos - 0.5). Smaller is more uncertain.
     scores = np.abs(probs[:, 1] - 0.5)
-    
-    # Sort by score ascending
-    sorted_indices = np.argsort(scores)
-    selected_indices = sorted_indices[:k]
-    
-    return [pool[i] for i in selected_indices], "neutral"
+    return [pool[i] for i in np.argsort(scores)[:k]]
 
-def strategy_verify_pos(k: int) -> Tuple[List[int], str]:
-    # Easy cases: prob close to 1.0 (Positive)
+def strategy_verify_pos(k: int) -> List[int]:
     pool = app_state.unlabeled[:min(len(app_state.unlabeled), 500)]
     probs, _ = predict_batch(pool)
-    
-    # Score = prob_pos. Larger is better.
-    scores = probs[:, 1]
-    
-    sorted_indices = np.argsort(scores)[::-1] # Descending
-    selected_indices = sorted_indices[:k]
-    
-    return [pool[i] for i in selected_indices], "positive"
+    return [pool[i] for i in np.argsort(probs[:, 1])[::-1][:k]]
 
-def strategy_verify_neg(k: int) -> Tuple[List[int], str]:
-    # Easy cases: prob close to 0.0 (Negative)
+def strategy_verify_neg(k: int) -> List[int]:
     pool = app_state.unlabeled[:min(len(app_state.unlabeled), 500)]
     probs, _ = predict_batch(pool)
-    
-    # Score = prob_pos. Smaller is better (more negative).
-    scores = probs[:, 1]
-    
-    sorted_indices = np.argsort(scores) # Ascending
-    selected_indices = sorted_indices[:k]
-    
-    return [pool[i] for i in selected_indices], "negative"
-
+    return [pool[i] for i in np.argsort(probs[:, 1])[:k]]
 
 # --- Flask App ---
 
@@ -292,142 +266,151 @@ app = Flask(__name__)
 def index():
     return render_template('index.html')
 
+@app.route('/api/config', methods=['POST'])
+def set_config():
+    data = request.json
+    data_type = data.get('type', 'image')
+    root_path = data.get('path', '')
+    
+    if not root_path or not os.path.exists(root_path):
+        return jsonify({"success": False, "message": "Invalid path"}), 400
+        
+    with app_state.lock:
+        app_state.data_source = DataSource(data_type, root_path)
+        app_state.labeled = {}
+        app_state.unlabeled = list(range(len(app_state.data_source.file_list)))
+        random.shuffle(app_state.unlabeled)
+        app_state.embed_cache = {}
+        app_state.model = None
+        app_state.optimizer = None
+        
+    return jsonify({
+        "success": True, 
+        "count": len(app_state.unlabeled),
+        "type": data_type
+    })
+
 @app.route('/api/set_query', methods=['POST'])
 def set_query():
-    data = request.json
-    query = data.get('query', '').strip()
-    
+    query = request.json.get('query', '').strip()
     with app_state.lock:
         if not query:
             app_state.text_query = None
             app_state.text_embedding = None
         else:
             app_state.text_query = query
-            print(f"Processing text query: {query}")
             with torch.no_grad():
                 text_tokens = tokenizer([query]).to(DEVICE)
                 text_features = clip_model.encode_text(text_tokens)
                 text_features /= text_features.norm(dim=-1, keepdim=True)
-                app_state.text_embedding = text_features # (1, 512)
-                
-    return jsonify({"success": True, "query": app_state.text_query})
+                app_state.text_embedding = text_features
+    return jsonify({"success": True})
 
 @app.route('/api/next_batch')
 def next_batch():
-    load_source_image()
+    if app_state.data_source is None:
+        return jsonify({"items": [], "batch_type": "neutral", "message": "Not configured"})
+        
     strategy = request.args.get('strategy', 'random')
-    try:
-        batch_size = int(request.args.get('batch_size', BATCH_SIZE))
-    except ValueError:
-        batch_size = BATCH_SIZE
+    batch_size = int(request.args.get('batch_size', BATCH_SIZE_DEFAULT))
     
     with app_state.lock:
         if not app_state.unlabeled:
             return jsonify({"items": [], "batch_type": "neutral"})
-
-        # Fallback if model not ready for model-based strategies
-        if app_state.model is None and strategy not in ['random', 'kmeans']:
-            strategy = 'random'
-            
-        if strategy == 'random':
-            ids, batch_type = strategy_random(batch_size)
-        elif strategy == 'kmeans':
-            ids, batch_type = strategy_kmeans(batch_size)
-        elif strategy == 'borderline':
-            ids, batch_type = strategy_uncertainty(batch_size)
-            # For borderline, sorting by prob_pos helps group similar levels of uncertainty
-        elif strategy == 'easy_pos':
-            ids, batch_type = strategy_verify_pos(batch_size)
-            # Already sorted by prob_pos descending in strategy
-        elif strategy == 'easy_neg':
-            ids, batch_type = strategy_verify_neg(batch_size)
-            # Already sorted by prob_pos ascending in strategy
-        else:
-            ids, batch_type = strategy_random(batch_size)
         
+        # Determine Batch Type
+        batch_type = "neutral"
+        if strategy == 'easy_pos': batch_type = "positive"
+        elif strategy == 'easy_neg': batch_type = "negative"
         app_state.current_batch_type = batch_type
+
+        # Select IDs
+        if app_state.model is None and strategy not in ['random', 'kmeans']:
+            if app_state.text_embedding is None: strategy = 'random'
+            
+        if strategy == 'random': ids = strategy_random(batch_size)
+        elif strategy == 'kmeans': ids = strategy_kmeans(batch_size)
+        elif strategy == 'borderline': ids = strategy_uncertainty(batch_size)
+        elif strategy == 'easy_pos': ids = strategy_verify_pos(batch_size)
+        elif strategy == 'easy_neg': ids = strategy_verify_neg(batch_size)
+        else: ids = strategy_random(batch_size)
         
-        # Get predictions for display
         probs, preds = predict_batch(ids)
-        
         response_data = []
         for i, idx in enumerate(ids):
-            img = get_image_crop(idx)
-            img_b64 = image_to_base64(img)
-            
-            prob_pos = float(probs[i][1])
-            pred_label = int(preds[i]) if app_state.model else None
+            img_pil = app_state.data_source.get_image(idx)
+            buf = io.BytesIO()
+            img_pil.save(buf, format='PNG')
+            img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
             
             response_data.append({
                 "id": idx,
                 "image": img_b64,
-                "prediction": pred_label,
-                "prob_pos": prob_pos
+                "filename": os.path.basename(app_state.data_source.file_list[idx]),
+                "prediction": int(preds[i]),
+                "prob_pos": float(probs[i][1])
             })
             
-        # Always sort response_data by confidence to help rapid labeling
-        if app_state.current_batch_type == "positive":
-            # Show highest confidence first
-            response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
-        elif app_state.current_batch_type == "negative":
-            # Show most likely negatives first (lowest prob_pos)
-            response_data.sort(key=lambda x: x['prob_pos'])
-        else:
-            # Neutral/Mixed: Sort by confidence descending to group predictions
-            response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
+        # Sort
+        if batch_type == "positive": response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
+        elif batch_type == "negative": response_data.sort(key=lambda x: x['prob_pos'])
+        else: response_data.sort(key=lambda x: x['prob_pos'], reverse=True)
             
-    return jsonify({
-        "items": response_data,
-        "batch_type": app_state.current_batch_type
-    })
+    return jsonify({"items": response_data, "batch_type": batch_type, "data_type": app_state.data_source.data_type})
 
 @app.route('/api/submit_labels', methods=['POST'])
 def submit_labels():
     data = request.json
-    # data format: [{"id": 1, "label": 1}, ...]
-    
-    triggered_training = False
-    
     with app_state.lock:
         for item in data:
             idx = item['id']
             label = int(item['label'])
-            
             app_state.labeled[idx] = label
-            if idx in app_state.unlabeled:
-                app_state.unlabeled.remove(idx)
-        
-        if len(app_state.labeled) >= 2:
-             train_step()
-             triggered_training = True
-    
-    return jsonify({
-        "success": True,
-        "triggered_training": triggered_training,
-        "labeled_count": len(app_state.labeled),
-        "unlabeled_count": len(app_state.unlabeled)
-    })
+            if idx in app_state.unlabeled: app_state.unlabeled.remove(idx)
+        if len(app_state.labeled) >= 2: train_step()
+    return jsonify({"success": True, "labeled_count": len(app_state.labeled), "unlabeled_count": len(app_state.unlabeled)})
 
 @app.route('/api/image/<int:idx>')
 def get_image(idx):
-    load_source_image() # ensure loaded
-    img = get_image_crop(idx)
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    return send_file(buf, mimetype='image/png')
+    if app_state.data_source:
+        img = app_state.data_source.get_image(idx)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+        return send_file(buf, mimetype='image/png')
+    return "Not configured", 404
+
+@app.route('/api/audio/<int:idx>')
+def get_audio(idx):
+    if app_state.data_source and app_state.data_source.data_type == 'audio':
+        path = app_state.data_source.get_audio_path(idx)
+        return send_file(path)
+    return "Not in audio mode", 404
 
 @app.route('/api/labeled_data')
 def get_labeled_data():
     grouped = {}
     with app_state.lock:
         for idx, label in app_state.labeled.items():
-            if label not in grouped:
-                grouped[label] = []
-            grouped[label].append(idx)
+            lbl_str = str(label)
+            if lbl_str not in grouped: grouped[lbl_str] = []
+            grouped[lbl_str].append(idx)
     return jsonify(grouped)
 
+@app.route('/api/export')
+def export_labels():
+    results = []
+    with app_state.lock:
+        if app_state.data_source:
+            for idx, label in app_state.labeled.items():
+                results.append({
+                    "filename": os.path.basename(app_state.data_source.file_list[idx]),
+                    "label": label
+                })
+    buf = io.BytesIO()
+    buf.write(json.dumps(results, indent=2).encode('utf-8'))
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name='labels.json', mimetype='application/json')
+
 if __name__ == '__main__':
-    load_source_image()
-    # DO NOT CHANGE THE PORT - FIXED AT 8008
-    app.run(debug=True, host='0.0.0.0', port=8008, use_reloader=False)
+    app.run(debug=True, host='0.0.0.0', port=PORT, use_reloader=False)

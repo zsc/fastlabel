@@ -3,14 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FastLabel: Binary Classification</title>
+    <title>FastLabel: Multi-modal Active Learning</title>
     <style>
         :root {
             --bg-neutral: #f4f4f9;
             --bg-pos: #e6fffa;
             --bg-neg: #fff5f5;
-            --card-pos: #38a169; /* Green border/active */
-            --card-neg: #e53e3e; /* Red border/active */
+            --card-pos: #38a169;
+            --card-neg: #e53e3e;
+            --primary: #007bff;
         }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -49,8 +50,8 @@
             color: #666;
         }
         .tab-btn.active {
-            border-bottom-color: #007bff;
-            color: #007bff;
+            border-bottom-color: var(--primary);
+            color: var(--primary);
             font-weight: bold;
         }
 
@@ -60,201 +61,273 @@
         .controls {
             margin-bottom: 20px;
             display: flex;
+            flex-wrap: wrap;
             gap: 15px;
             align-items: center;
             background: white;
-            padding: 10px;
+            padding: 15px;
             border-radius: 8px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
         
         button {
             padding: 10px 20px;
-            background-color: #007bff;
+            background-color: var(--primary);
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 16px;
+            font-size: 14px;
             font-weight: 500;
         }
         button:hover { background-color: #0056b3; }
         button:disabled { background-color: #ccc; cursor: not-allowed; }
-        button.submit-btn { background-color: #28a745; width: 200px;}
-        button.submit-btn:hover { background-color: #218838; }
+        button.secondary { background-color: #6c757d; }
+        button.submit-btn { background-color: #28a745; }
 
-        select {
-            padding: 10px;
+        input[type="text"] {
+            padding: 8px 12px;
             border-radius: 4px;
             border: 1px solid #ddd;
-            font-size: 16px;
+            flex-grow: 1;
         }
 
-        /* Labeling Grid */
+        select {
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+
+        /* Grid Layout */
         #grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-            gap: 10px;
-        }
-        
-        /* Review Grid - High Density */
-        .review-group {
-            margin-bottom: 30px;
-        }
-        .review-group h3 {
-            margin-bottom: 10px;
-            padding-bottom: 5px;
-            border-bottom: 2px solid #ddd;
-        }
-        .review-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 2px; /* Very tight gap */
-        }
-        .review-item {
-            width: 48px;
-            height: 48px;
-            position: relative;
-        }
-        .review-item img {
-            width: 100%;
-            height: 100%;
-            display: block;
-            image-rendering: pixelated;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 15px;
         }
         
         .card {
             background: white;
-            border-radius: 4px;
+            border-radius: 6px;
             overflow: hidden;
             cursor: pointer;
             position: relative;
             border: 4px solid transparent;
             transition: all 0.1s;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
         }
         
         .card img {
             width: 100%;
             height: auto;
             display: block;
-            image-rendering: pixelated;
+            image-rendering: auto;
+            aspect-ratio: 1 / 1;
+            object-fit: cover;
         }
         
         .card-overlay {
             position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0,0,0,0.6);
+            bottom: 0; left: 0; right: 0;
+            background: rgba(0,0,0,0.7);
             color: white;
             font-size: 10px;
-            padding: 2px 4px;
+            padding: 4px 8px;
             display: flex;
             justify-content: space-between;
+            pointer-events: none;
         }
 
-        /* States */
         .card.is-positive { border-color: var(--card-pos); }
-        .card.is-negative { border-color: var(--card-neg); opacity: 0.6; } /* Dim negatives to de-emphasize */
+        .card.is-negative { border-color: var(--card-neg); opacity: 0.7; }
 
-        .loading {
-            text-align: center;
-            padding: 40px;
-            font-size: 18px;
-            color: #666;
-            display: none;
-            position: fixed;
+        /* Audio Specific */
+        .play-btn {
+            position: absolute;
             top: 50%; left: 50%;
             transform: translate(-50%, -50%);
-            background: white;
-            padding: 20px 40px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            z-index: 100;
+            width: 40px; height: 40px;
+            background: rgba(0,0,0,0.5);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            opacity: 0;
+            transition: opacity 0.2s;
+            z-index: 10;
         }
-        
-        .batch-instruction {
+        .card:hover .play-btn { opacity: 1; }
+        .play-btn:hover { background: var(--primary); }
+
+        .cursor {
+            position: absolute;
+            top: 0; bottom: 0;
+            width: 2px;
+            background: rgba(255, 0, 0, 0.8);
+            display: none;
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        /* Configuration Tab Styles */
+        .config-form {
+            max-width: 600px;
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin: 20px auto;
+        }
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; margin-bottom: 8px; font-weight: bold; }
+        .form-group input, .form-group select { width: 100%; box-sizing: border-box; }
+
+        /* Review Styles */
+        .review-group { margin-bottom: 40px; }
+        .review-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+        .review-item { width: 64px; height: 64px; }
+        .review-item img { width: 100%; height: 100%; object-fit: cover; }
+
+        .loading-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(255,255,255,0.8);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            font-size: 20px;
             font-weight: bold;
-            color: #555;
-            margin-right: auto;
         }
     </style>
 </head>
 <body>
 
 <header>
-    <h1>FastLabel: Binary</h1>
+    <h1>FastLabel Multi-modal</h1>
     <div class="stats">
         Labeled: <span id="labeled-count">0</span> | Unlabeled: <span id="unlabeled-count">?</span>
     </div>
 </header>
 
 <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('labeling')">Labeling</button>
-    <button class="tab-btn" onclick="switchTab('review')">Review All</button>
+    <button class="tab-btn active" id="tab-labeling" onclick="switchTab('labeling')">Labeling</button>
+    <button class="tab-btn" id="tab-review" onclick="switchTab('review')">Review All</button>
+    <button class="tab-btn" id="tab-config" onclick="switchTab('config')">Configuration</button>
 </div>
 
-<!-- Labeling View -->
+<!-- Config Section -->
+<div id="view-config" class="view-section">
+    <div class="config-form">
+        <h2>System Configuration</h2>
+        <div class="form-group">
+            <label>Data Type</label>
+            <select id="config-type">
+                <option value="image">Image</option>
+                <option value="audio">Audio (Mel-Spectrogram)</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Data Path (Local absolute path)</label>
+            <input type="text" id="config-path" placeholder="/Users/me/data/dataset">
+        </div>
+        <button onclick="applyConfig()">Initialize Dataset</button>
+        <p style="color: #666; font-size: 12px; margin-top: 10px;">
+            Note: Initializing will clear current labeling progress in memory.
+        </p>
+    </div>
+</div>
+
+<!-- Labeling Section -->
 <div id="view-labeling" class="view-section active">
     <div class="controls">
-        <label for="strategy">Strategy:</label>
         <select id="strategy">
-            <option value="random">Random (Cold Start)</option>
-            <option value="kmeans">K-Means (Diversity)</option>
-            <option value="borderline">Borderline (Uncertainty)</option>
-            <option value="easy_pos">Verify Positives (Easy)</option>
-            <option value="easy_neg">Verify Negatives (Easy)</option>
+            <option value="random">Random (Diversity)</option>
+            <option value="kmeans">K-Means (Clustering)</option>
+            <option value="borderline">Borderline (Uncertain)</option>
+            <option value="easy_pos">Verify Positives</option>
+            <option value="easy_neg">Verify Negatives</option>
         </select>
         
-        <label for="batch-size">Size:</label>
         <select id="batch-size">
-            <option value="12">12</option>
-            <option value="24" selected>24</option>
-            <option value="48">48</option>
-            <option value="96">96</option>
+            <option value="12">12 items</option>
+            <option value="24" selected>24 items</option>
+            <option value="48">48 items</option>
+            <option value="96">96 items</option>
         </select>
-        
-        <div class="batch-instruction" id="batch-instruction">
-            Load a batch to start.
-        </div>
-        
-        <div style="display:flex; gap:5px;">
-            <input type="text" id="text-query" placeholder="Initial Text Query (Zero-shot)" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
-            <button onclick="setQuery()" style="padding: 10px;">Set</button>
-        </div>
 
-        <button id="load-btn" onclick="loadBatch()">Load Batch</button>
-        <button id="submit-btn" class="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
+        <input type="text" id="text-query" placeholder="Zero-shot prompt (e.g. 'smiling')">
+        <button onclick="setQuery()">Set Query</button>
+
+        <div style="flex-grow: 1;"></div>
+        
+        <button onclick="loadBatch()">Load Batch</button>
+        <button class="submit-btn" id="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
     </div>
 
+    <div id="batch-instruction" style="margin-bottom: 10px; font-weight: bold; color: #555;"></div>
     <div id="grid"></div>
 </div>
 
-<!-- Review View -->
+<!-- Review Section -->
 <div id="view-review" class="view-section">
-    <div id="review-content">
-        <!-- Loaded dynamically -->
+    <div class="controls">
+        <button onclick="exportLabels()">Export Labels (JSON)</button>
+        <button class="secondary" onclick="loadReviewData()">Refresh List</button>
     </div>
+    <div id="review-content"></div>
 </div>
 
-<div id="loading" class="loading">Processing & Training...</div>
+<div id="loading" class="loading-overlay">Processing...</div>
+
+<!-- Global Audio Element -->
+<audio id="global-audio"></audio>
 
 <script>
     let currentBatch = [];
-    let currentBatchType = "neutral"; // neutral, positive, negative
+    let currentBatchType = "neutral";
+    let currentDataType = "image";
     let labelState = {}; 
+    let playingId = null;
+    let animationFrame = null;
+
+    const audioEl = document.getElementById('global-audio');
 
     function switchTab(tabName) {
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active'));
         
-        if (tabName === 'labeling') {
-            document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
-            document.getElementById('view-labeling').classList.add('active');
-        } else {
-            document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
-            document.getElementById('view-review').classList.add('active');
-            loadReviewData();
+        document.getElementById(`tab-${tabName}`).classList.add('active');
+        document.getElementById(`view-${tabName}`).classList.add('active');
+        
+        if (tabName === 'review') loadReviewData();
+    }
+
+    async function applyConfig() {
+        const type = document.getElementById('config-type').value;
+        const path = document.getElementById('config-path').value;
+        if (!path) return alert("Path is required");
+
+        showLoading(true);
+        try {
+            const res = await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type, path })
+            });
+            const data = await res.json();
+            if (data.success) {
+                alert(`Successfully loaded ${data.count} items.`);
+                currentDataType = data.type;
+                switchTab('labeling');
+            } else {
+                alert("Error: " + data.message);
+            }
+        } catch (e) {
+            alert("Connection error");
+        } finally {
+            showLoading(false);
         }
     }
 
@@ -265,18 +338,16 @@
             await fetch('/api/set_query', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query: query })
+                body: JSON.stringify({ query })
             });
-            alert("Query set! Now use 'Verify Positives' strategy.");
-        } catch (e) {
-            console.error(e);
-            alert("Error setting query");
+            alert("Query set. Now use 'Verify Positives'.");
         } finally {
             showLoading(false);
         }
     }
 
     async function loadBatch() {
+        stopAudio();
         showLoading(true);
         const strategy = document.getElementById('strategy').value;
         const batchSize = document.getElementById('batch-size').value;
@@ -285,16 +356,18 @@
             const res = await fetch(`/api/next_batch?strategy=${strategy}&batch_size=${batchSize}`);
             const data = await res.json();
             
-            currentBatch = data.items || [];
-            currentBatchType = data.batch_type || "neutral";
+            if (data.items.length === 0 && data.message) {
+                alert(data.message);
+                return;
+            }
+
+            currentBatch = data.items;
+            currentBatchType = data.batch_type;
+            currentDataType = data.data_type;
             
             updateUIForBatchType();
             renderGrid();
-            
             document.getElementById('submit-btn').disabled = false;
-        } catch (e) {
-            console.error(e);
-            alert("Error loading batch");
         } finally {
             showLoading(false);
         }
@@ -303,23 +376,20 @@
     function updateUIForBatchType() {
         const body = document.body;
         const instr = document.getElementById('batch-instruction');
-        
         body.classList.remove('mode-positive', 'mode-negative');
         labelState = {};
         
         if (currentBatchType === 'positive') {
             body.classList.add('mode-positive');
-            instr.innerText = "Verify Positives: Click images that are NOT Positive.";
+            instr.innerText = "Verify Positives: Toggle items that are WRONG (should be Negative).";
             currentBatch.forEach(item => labelState[item.id] = 1);
         } else if (currentBatchType === 'negative') {
             body.classList.add('mode-negative');
-            instr.innerText = "Verify Negatives: Click images that are NOT Negative.";
+            instr.innerText = "Verify Negatives: Toggle items that are WRONG (should be Positive).";
             currentBatch.forEach(item => labelState[item.id] = 0);
         } else {
-            instr.innerText = "Label Mixed Batch: Click to toggle (Green=Pos, Red=Neg).";
-            currentBatch.forEach(item => {
-                labelState[item.id] = (item.prediction === 1) ? 1 : 0;
-            });
+            instr.innerText = "Mixed Batch: Toggle to correct labels (Green=Pos, Red=Neg).";
+            currentBatch.forEach(item => labelState[item.id] = item.prediction);
         }
     }
 
@@ -329,18 +399,26 @@
         
         currentBatch.forEach(item => {
             const card = document.createElement('div');
+            card.className = 'card';
+            card.id = `card-${item.id}`;
             updateCardClass(card, labelState[item.id]);
             
-            let confStr = "";
-            if (item.prob_pos !== undefined) {
-                confStr = (item.prob_pos * 100).toFixed(0) + "% Pos";
-            }
+            const conf = (item.prob_pos * 100).toFixed(0);
             
+            let audioHtml = "";
+            if (currentDataType === 'audio') {
+                audioHtml = `
+                    <div class="play-btn" onclick="toggleAudio(${item.id}, event)">▶</div>
+                    <div class="cursor" id="cursor-${item.id}"></div>
+                `;
+            }
+
             card.innerHTML = `
                 <img src="data:image/png;base64,${item.image}" alt="${item.id}">
+                ${audioHtml}
                 <div class="card-overlay">
-                    <span>#${item.id}</span>
-                    <span>${confStr}</span>
+                    <span title="${item.filename}">${item.filename.substring(0, 15)}...</span>
+                    <span>${conf}% P</span>
                 </div>
             `;
             
@@ -349,28 +427,18 @@
         });
     }
 
-    function updateCardClass(cardElement, label) {
-        cardElement.className = 'card'; 
-        if (label === 1) {
-            cardElement.classList.add('is-positive');
-        } else {
-            cardElement.classList.add('is-negative');
-        }
+    function toggleLabel(id, card) {
+        labelState[id] = labelState[id] === 1 ? 0 : 1;
+        updateCardClass(card, labelState[id]);
     }
 
-    function toggleLabel(id, cardElement) {
-        labelState[id] = labelState[id] === 1 ? 0 : 1;
-        updateCardClass(cardElement, labelState[id]);
+    function updateCardClass(card, label) {
+        card.classList.remove('is-positive', 'is-negative');
+        card.classList.add(label === 1 ? 'is-positive' : 'is-negative');
     }
 
     async function submitBatch() {
-        const labels = [];
-        for (const [id, lbl] of Object.entries(labelState)) {
-            labels.push({ id: parseInt(id), label: lbl });
-        }
-
-        if (labels.length === 0) return;
-
+        const labels = Object.entries(labelState).map(([id, label]) => ({ id: parseInt(id), label }));
         showLoading(true);
         try {
             const res = await fetch('/api/submit_labels', {
@@ -379,75 +447,86 @@
                 body: JSON.stringify(labels)
             });
             const result = await res.json();
-            
-            if (result.success) {
-                document.getElementById('labeled-count').innerText = result.labeled_count;
-                document.getElementById('unlabeled-count').innerText = result.unlabeled_count;
-                await loadBatch();
-            }
-        } catch (e) {
-            console.error(e);
-            alert("Error submitting labels");
+            document.getElementById('labeled-count').innerText = result.labeled_count;
+            document.getElementById('unlabeled-count').innerText = result.unlabeled_count;
+            await loadBatch();
+        } finally {
             showLoading(false);
         }
     }
-    
-    // --- Review Tab Logic ---
-    
-    async function loadReviewData() {
-        const container = document.getElementById('review-content');
-        container.innerHTML = '<div style="padding:20px;">Loading...</div>';
-        
-        try {
-            const res = await fetch('/api/labeled_data');
-            const data = await res.json();
-            
-            container.innerHTML = '';
-            
-            // Labels to sort? 1 (Positive) then 0 (Negative) usually
-            const labels = Object.keys(data).sort((a,b) => b - a);
-            
-            labels.forEach(lbl => {
-                const ids = data[lbl];
-                const group = document.createElement('div');
-                group.className = 'review-group';
-                
-                const labelName = lbl === "1" ? "Positive" : "Negative";
-                const color = lbl === "1" ? "green" : "red";
-                
-                group.innerHTML = `<h3 style="color:${color}">${labelName} (${ids.length})</h3>`;
-                
-                const grid = document.createElement('div');
-                grid.className = 'review-grid';
-                
-                // Show max 500 per group to avoid browser crash in demo? Or infinite scroll?
-                // Let's just show all for now as per "preview all" request, assuming < few thousands
-                ids.forEach(id => {
-                    const item = document.createElement('div');
-                    item.className = 'review-item';
-                    // Lazy load logic could be added here (loading="lazy")
-                    item.innerHTML = `<img src="/api/image/${id}" loading="lazy" title="#${id}">`;
-                    grid.appendChild(item);
-                });
-                
-                group.appendChild(grid);
-                container.appendChild(group);
-            });
-            
-            if (labels.length === 0) {
-                container.innerHTML = '<div style="padding:20px;">No labeled data yet.</div>';
-            }
-            
-        } catch (e) {
-            console.error(e);
-            container.innerHTML = 'Error loading data.';
+
+    // --- Audio Logic ---
+
+    function toggleAudio(id, event) {
+        event.stopPropagation();
+        if (playingId === id) {
+            stopAudio();
+        } else {
+            playAudio(id);
         }
     }
 
+    function playAudio(id) {
+        stopAudio();
+        playingId = id;
+        audioEl.src = `/api/audio/${id}`;
+        audioEl.play();
+        
+        const cursor = document.getElementById(`cursor-${id}`);
+        cursor.style.display = 'block';
+        
+        function updateCursor() {
+            if (playingId !== id) return;
+            const progress = audioEl.currentTime / audioEl.duration;
+            cursor.style.left = `${progress * 100}%`;
+            animationFrame = requestAnimationFrame(updateCursor);
+        }
+        
+        audioEl.onended = stopAudio;
+        animationFrame = requestAnimationFrame(updateCursor);
+    }
+
+    function stopAudio() {
+        if (playingId !== null) {
+            const cursor = document.getElementById(`cursor-${playingId}`);
+            if (cursor) cursor.style.display = 'none';
+        }
+        audioEl.pause();
+        playingId = null;
+        if (animationFrame) cancelAnimationFrame(animationFrame);
+    }
+
+    // --- Review & Export ---
+
+    async function loadReviewData() {
+        const container = document.getElementById('review-content');
+        container.innerHTML = 'Loading...';
+        try {
+            const res = await fetch('/api/labeled_data');
+            const data = await res.json();
+            container.innerHTML = '';
+            
+            Object.keys(data).sort((a,b) => b-a).forEach(lbl => {
+                const group = document.createElement('div');
+                group.className = 'review-group';
+                group.innerHTML = `<h3 style="color:${lbl==='1'?'green':'red'}">${lbl==='1'?'Positive':'Negative'} (${data[lbl].length})</h3>`;
+                const grid = document.createElement('div');
+                grid.className = 'review-grid';
+                data[lbl].forEach(id => {
+                    grid.innerHTML += `<div class="review-item"><img src="/api/image/${id}" loading="lazy" title="#${id}"></div>`;
+                });
+                group.appendChild(grid);
+                container.appendChild(group);
+            });
+        } catch (e) { container.innerHTML = 'Error loading.'; }
+    }
+
+    function exportLabels() {
+        window.location.href = '/api/export';
+    }
+
     function showLoading(show) {
-        document.getElementById('loading').style.display = show ? 'block' : 'none';
-        const grid = document.getElementById('grid');
-        if (grid) grid.style.opacity = show ? '0.3' : '1';
+        document.getElementById('loading').style.display = show ? 'flex' : 'none';
     }
 </script>
 

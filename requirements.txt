@@ -5,3 +5,5 @@ pillow
 numpy
 requests
 scikit-learn
+librosa
+matplotlib
