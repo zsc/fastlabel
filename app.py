@@ -8,12 +8,13 @@ import base64
 import numpy as np
 from PIL import Image
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import open_clip
+from sklearn.cluster import KMeans
 
 from flask import Flask, render_template, request, jsonify
 
@@ -24,8 +25,8 @@ TILE_SIZE = 48
 COLS = 200
 ROWS = 150
 TOTAL_IMAGES = COLS * ROWS
-BATCH_SIZE = 10  # Number of images to show per batch
-NUM_CLASSES = 10 # 0-9
+BATCH_SIZE = 24  # Increased for higher density
+NUM_CLASSES = 2 # Binary: 0 (Negative), 1 (Positive)
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 # --- Model Definitions ---
@@ -52,12 +53,11 @@ class State:
     embed_cache: Dict[int, np.ndarray] = field(default_factory=dict)
     model: Optional[MLPHead] = None
     optimizer: Optional[optim.Optimizer] = None
-    steps_since_train: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
-    
-    # Cache for the large image to avoid reopening it constantly
-    # In a real production app, we might use memory mapping or a database
     source_image: Optional[Image.Image] = None
+    
+    # Track current batch context to know what the user was verifying
+    current_batch_type: str = "neutral" # neutral, positive, negative
 
 app_state = State()
 
@@ -76,25 +76,20 @@ def download_image_if_not_exists():
         except Exception as e:
             print(f"Error downloading image: {e}")
             raise e
-    else:
-        print(f"Found {IMAGE_FILENAME}.")
 
 def load_source_image():
     if app_state.source_image is None:
         download_image_if_not_exists()
         app_state.source_image = Image.open(IMAGE_FILENAME).convert('RGB')
         # Initialize unlabeled pool
-        # For this demo, let's limit to first 1000 to keep it snappy if needed, 
-        # or use full if memory allows. 30k ints is fine.
         app_state.unlabeled = list(range(TOTAL_IMAGES))
         random.shuffle(app_state.unlabeled)
 
 def get_image_crop(idx: int) -> Image.Image:
     if app_state.source_image is None:
         load_source_image()
-    
-    if app_state.source_image is None:
-        raise RuntimeError("Failed to load source image")
+    if app_state.source_image is None: # explicit check for mypy/runtime safety
+         raise RuntimeError("Image not loaded")
     
     col = idx % COLS
     row = idx // COLS
@@ -119,7 +114,6 @@ clip_model.eval()
 print("CLIP initialized.")
 
 def get_embedding(idx: int) -> np.ndarray:
-    """Get CLIP embedding for image at idx. Compute and cache if necessary."""
     if idx in app_state.embed_cache:
         return app_state.embed_cache[idx]
     
@@ -136,30 +130,29 @@ def get_embedding(idx: int) -> np.ndarray:
 
 def init_mlp_if_needed():
     if app_state.model is None:
-        # Get embedding dimension from a sample
         sample_embed = get_embedding(0)
         input_dim = sample_embed.shape[0]
         app_state.model = MLPHead(input_dim, NUM_CLASSES).to(DEVICE)
         app_state.optimizer = optim.Adam(app_state.model.parameters(), lr=1e-3)
 
 def train_step():
-    """Perform a training step using all labeled data."""
     if not app_state.labeled:
         return
 
     init_mlp_if_needed()
+    if app_state.model is None or app_state.optimizer is None: return
+
     app_state.model.train()
     
-    # Prepare data
     ids = list(app_state.labeled.keys())
     labels = list(app_state.labeled.values())
     
+    # Minimal caching for speed, but re-fetching from dict is fast enough
     embeddings = [get_embedding(i) for i in ids]
     
     X = torch.tensor(np.array(embeddings), dtype=torch.float32).to(DEVICE)
     y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
     
-    # Train for a few epochs per trigger
     epochs = 5 
     for _ in range(epochs):
         app_state.optimizer.zero_grad()
@@ -170,21 +163,96 @@ def train_step():
         
     print(f"Training step complete. Loss: {loss.item():.4f}, Labeled count: {len(ids)}")
 
-def predict(idx: int) -> Tuple[int, float]:
-    """Return (predicted_label, confidence) for an image index."""
+def predict_batch(ids: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Returns (probs, predictions) for a list of IDs."""
     if app_state.model is None:
-        return -1, 0.0
+        # Uniform probability if no model
+        return np.ones((len(ids), NUM_CLASSES)) / NUM_CLASSES, np.zeros(len(ids))
     
-    embedding = get_embedding(idx)
-    X = torch.tensor(embedding, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    embeddings = [get_embedding(i) for i in ids]
+    X = torch.tensor(np.array(embeddings), dtype=torch.float32).to(DEVICE)
     
     app_state.model.eval()
     with torch.no_grad():
         outputs = app_state.model(X)
-        probs = torch.softmax(outputs, dim=1)
-        confidence, predicted = torch.max(probs, 1)
+        probs = torch.softmax(outputs, dim=1) # (N, 2)
+        _, preds = torch.max(probs, 1)
         
-    return predicted.item(), confidence.item()
+    return probs.cpu().numpy(), preds.cpu().numpy()
+
+# --- Strategies ---
+
+def strategy_random(k: int) -> Tuple[List[int], str]:
+    pool = app_state.unlabeled[:min(len(app_state.unlabeled), 1000)] # sample from top 1000 for speed
+    selected = random.sample(pool, min(k, len(pool)))
+    return selected, "neutral"
+
+def strategy_kmeans(k: int) -> Tuple[List[int], str]:
+    # Cluster a subset of unlabeled data
+    pool_size = min(len(app_state.unlabeled), 1000)
+    pool = app_state.unlabeled[:pool_size]
+    
+    embeddings = np.array([get_embedding(i) for i in pool])
+    
+    # We want 'k' items. If k is small, we can just pick k randoms?
+    # Or actually, the prompt says "KMeans Big Class".
+    # Interpretation: Cluster into K clusters, pick center of each?
+    # Or: Cluster into X clusters, pick one whole cluster?
+    # Let's interpret as: Find diversity. Cluster into k, pick centers.
+    
+    n_clusters = min(k, pool_size)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=5, max_iter=100)
+    kmeans.fit(embeddings)
+    
+    # Find closest samples to centers
+    selected = []
+    for center in kmeans.cluster_centers_:
+        dists = np.linalg.norm(embeddings - center, axis=1)
+        idx = np.argmin(dists)
+        selected.append(pool[idx])
+        
+    return selected, "neutral"
+
+def strategy_uncertainty(k: int) -> Tuple[List[int], str]:
+    # Borderline cases: prob close to 0.5
+    pool = app_state.unlabeled[:min(len(app_state.unlabeled), 500)]
+    probs, _ = predict_batch(pool)
+    
+    # Score = abs(prob_pos - 0.5). Smaller is more uncertain.
+    scores = np.abs(probs[:, 1] - 0.5)
+    
+    # Sort by score ascending
+    sorted_indices = np.argsort(scores)
+    selected_indices = sorted_indices[:k]
+    
+    return [pool[i] for i in selected_indices], "neutral"
+
+def strategy_verify_pos(k: int) -> Tuple[List[int], str]:
+    # Easy cases: prob close to 1.0 (Positive)
+    pool = app_state.unlabeled[:min(len(app_state.unlabeled), 500)]
+    probs, _ = predict_batch(pool)
+    
+    # Score = prob_pos. Larger is better.
+    scores = probs[:, 1]
+    
+    sorted_indices = np.argsort(scores)[::-1] # Descending
+    selected_indices = sorted_indices[:k]
+    
+    return [pool[i] for i in selected_indices], "positive"
+
+def strategy_verify_neg(k: int) -> Tuple[List[int], str]:
+    # Easy cases: prob close to 0.0 (Negative)
+    pool = app_state.unlabeled[:min(len(app_state.unlabeled), 500)]
+    probs, _ = predict_batch(pool)
+    
+    # Score = prob_pos. Smaller is better (more negative).
+    scores = probs[:, 1]
+    
+    sorted_indices = np.argsort(scores) # Ascending
+    selected_indices = sorted_indices[:k]
+    
+    return [pool[i] for i in selected_indices], "negative"
+
 
 # --- Flask App ---
 
@@ -196,44 +264,59 @@ def index():
 
 @app.route('/api/next_batch')
 def next_batch():
-    load_source_image() # Ensure loaded
+    load_source_image()
+    strategy = request.args.get('strategy', 'random')
     
     with app_state.lock:
-        # Strategy: Random for now (or could be uncertainty sampling if model exists)
-        # For simplicity and speed in demo: just take next available from shuffled list
+        if not app_state.unlabeled:
+            return jsonify([])
+
+        # Fallback if model not ready for model-based strategies
+        if app_state.model is None and strategy not in ['random', 'kmeans']:
+            strategy = 'random'
+            
+        if strategy == 'random':
+            ids, batch_type = strategy_random(BATCH_SIZE)
+        elif strategy == 'kmeans':
+            ids, batch_type = strategy_kmeans(BATCH_SIZE)
+        elif strategy == 'borderline':
+            ids, batch_type = strategy_uncertainty(BATCH_SIZE)
+        elif strategy == 'easy_pos':
+            ids, batch_type = strategy_verify_pos(BATCH_SIZE)
+        elif strategy == 'easy_neg':
+            ids, batch_type = strategy_verify_neg(BATCH_SIZE)
+        else:
+            ids, batch_type = strategy_random(BATCH_SIZE)
         
-        batch_ids = []
-        candidates = []
+        app_state.current_batch_type = batch_type
         
-        # If we have a model, we could score unlabeled items. 
-        # But scanning all 30k for uncertainty is slow without vector search/indexing.
-        # Let's just pick a random subset to score, then pick best from there.
-        pool_size = min(len(app_state.unlabeled), 100)
-        candidates = app_state.unlabeled[:pool_size]
-        
-        # If model exists, maybe sort by uncertainty (entropy)? 
-        # For now, just return random candidates to keep UI responsive.
-        batch_ids = candidates[:BATCH_SIZE]
+        # Get predictions for display
+        probs, preds = predict_batch(ids)
         
         response_data = []
-        for idx in batch_ids:
+        for i, idx in enumerate(ids):
             img = get_image_crop(idx)
             img_b64 = image_to_base64(img)
-            pred_label, conf = predict(idx)
+            
+            prob_pos = float(probs[i][1])
+            pred_label = int(preds[i]) if app_state.model else None
             
             response_data.append({
                 "id": idx,
                 "image": img_b64,
-                "prediction": pred_label if pred_label != -1 else None,
-                "confidence": float(f"{conf:.2f}") if pred_label != -1 else None
+                "prediction": pred_label,
+                "prob_pos": prob_pos
             })
             
-    return jsonify(response_data)
+    return jsonify({
+        "items": response_data,
+        "batch_type": app_state.current_batch_type
+    })
 
 @app.route('/api/submit_labels', methods=['POST'])
 def submit_labels():
     data = request.json
-    # data format: [{"id": 1, "label": 3}, ...]
+    # data format: [{"id": 1, "label": 1}, ...]
     
     triggered_training = False
     
@@ -246,10 +329,7 @@ def submit_labels():
             if idx in app_state.unlabeled:
                 app_state.unlabeled.remove(idx)
         
-        # Check if we should train
-        # For demo, train every time a batch is submitted (if we have enough data)
-        # Or simple rule: if labeled count > classes
-        if len(app_state.labeled) >= 2: # Minimal requirement
+        if len(app_state.labeled) >= 2:
              train_step()
              triggered_training = True
     
@@ -261,8 +341,6 @@ def submit_labels():
     })
 
 if __name__ == '__main__':
-    # Initialize image
     load_source_image()
-    # Start app
-    app.run(debug=True, host='0.0.0.0', port=8008, use_reloader=False) 
-    # use_reloader=False to avoid double initialization of CLIP which is heavy
+    # DO NOT CHANGE THE PORT - FIXED AT 8008
+    app.run(debug=True, host='0.0.0.0', port=8008, use_reloader=False)

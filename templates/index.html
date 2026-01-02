@@ -3,16 +3,27 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FastLabel: CelebA Demo</title>
+    <title>FastLabel: Binary Classification</title>
     <style>
+        :root {
+            --bg-neutral: #f4f4f9;
+            --bg-pos: #e6fffa;
+            --bg-neg: #fff5f5;
+            --card-pos: #38a169; /* Green border/active */
+            --card-neg: #e53e3e; /* Red border/active */
+        }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #f4f4f9;
+            background-color: var(--bg-neutral);
             color: #333;
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
             padding: 20px;
+            transition: background-color 0.3s;
         }
+        body.mode-positive { background-color: var(--bg-pos); }
+        body.mode-negative { background-color: var(--bg-neg); }
+
         header {
             display: flex;
             justify-content: space-between;
@@ -27,8 +38,14 @@
         .controls {
             margin-bottom: 20px;
             display: flex;
-            gap: 10px;
+            gap: 15px;
+            align-items: center;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
+        
         button {
             padding: 10px 20px;
             background-color: #007bff;
@@ -37,95 +54,139 @@
             border-radius: 4px;
             cursor: pointer;
             font-size: 16px;
+            font-weight: 500;
         }
         button:hover { background-color: #0056b3; }
         button:disabled { background-color: #ccc; cursor: not-allowed; }
-        
+        button.submit-btn { background-color: #28a745; width: 200px;}
+        button.submit-btn:hover { background-color: #218838; }
+
+        select {
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            font-size: 16px;
+        }
+
         #grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 10px;
         }
         
         .card {
             background: white;
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            text-align: center;
-        }
-        .card img {
-            width: 96px; /* 2x scale */
-            height: 96px;
-            image-rendering: pixelated;
-            margin-bottom: 10px;
             border-radius: 4px;
-            border: 1px solid #eee;
-        }
-        .meta {
-            font-size: 12px;
-            color: #888;
-            margin-bottom: 10px;
-            width: 100%;
-        }
-        .prediction {
-            font-size: 12px;
-            color: #007bff;
-            font-weight: bold;
-            margin-bottom: 10px;
-            height: 1.5em; /* reserve space */
-        }
-        select {
-            width: 100%;
-            padding: 8px;
-            border-radius: 4px;
-            border: 1px solid #ddd;
+            overflow: hidden;
+            cursor: pointer;
+            position: relative;
+            border: 4px solid transparent;
+            transition: all 0.1s;
         }
         
+        .card img {
+            width: 100%;
+            height: auto;
+            display: block;
+            image-rendering: pixelated;
+        }
+        
+        .card-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            font-size: 10px;
+            padding: 2px 4px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* States */
+        .card.is-positive { border-color: var(--card-pos); }
+        .card.is-negative { border-color: var(--card-neg); opacity: 0.6; } /* Dim negatives to de-emphasize */
+
+        /* In 'Verify Positive' mode, maybe we highlight negatives differently? */
+        /* Let's stick to Green=Pos, Red=Neg */
+
         .loading {
             text-align: center;
             padding: 40px;
             font-size: 18px;
             color: #666;
-            grid-column: 1 / -1;
             display: none;
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 20px 40px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            z-index: 100;
+        }
+        
+        .batch-instruction {
+            font-weight: bold;
+            color: #555;
+            margin-right: auto;
         }
     </style>
 </head>
 <body>
 
 <header>
-    <h1>FastLabel Demo (CelebA)</h1>
+    <h1>FastLabel: Binary</h1>
     <div class="stats">
         Labeled: <span id="labeled-count">0</span> | Unlabeled: <span id="unlabeled-count">?</span>
     </div>
 </header>
 
 <div class="controls">
-    <button id="load-btn" onclick="loadBatch()">Load Next Batch</button>
-    <button id="submit-btn" onclick="submitBatch()" disabled>Submit Labels</button>
+    <label for="strategy">Strategy:</label>
+    <select id="strategy">
+        <option value="random">Random (Cold Start)</option>
+        <option value="kmeans">K-Means (Diversity)</option>
+        <option value="borderline">Borderline (Uncertainty)</option>
+        <option value="easy_pos">Verify Positives (Easy)</option>
+        <option value="easy_neg">Verify Negatives (Easy)</option>
+    </select>
+    
+    <div class="batch-instruction" id="batch-instruction">
+        Load a batch to start.
+    </div>
+
+    <button id="load-btn" onclick="loadBatch()">Load Batch</button>
+    <button id="submit-btn" class="submit-btn" onclick="submitBatch()" disabled>Confirm & Train</button>
 </div>
 
-<div id="grid">
-    <!-- Cards go here -->
-</div>
-<div id="loading" class="loading">Processing...</div>
+<div id="grid"></div>
+<div id="loading" class="loading">Processing & Training...</div>
 
 <script>
     let currentBatch = [];
+    let currentBatchType = "neutral"; // neutral, positive, negative
+
+    // Helper: Map ID to current label state (1=Pos, 0=Neg)
+    let labelState = {}; 
 
     async function loadBatch() {
         showLoading(true);
+        const strategy = document.getElementById('strategy').value;
+        
         try {
-            const res = await fetch('/api/next_batch');
+            const res = await fetch(`/api/next_batch?strategy=${strategy}`);
             const data = await res.json();
-            currentBatch = data;
-            renderGrid(data);
+            
+            currentBatch = data.items || []; // items list
+            currentBatchType = data.batch_type || "neutral";
+            
+            updateUIForBatchType();
+            renderGrid();
+            
             document.getElementById('submit-btn').disabled = false;
-            document.getElementById('load-btn').disabled = true;
+            // document.getElementById('load-btn').disabled = true; // Can allow reload if wanted
         } catch (e) {
             console.error(e);
             alert("Error loading batch");
@@ -134,58 +195,89 @@
         }
     }
 
-    function renderGrid(data) {
+    function updateUIForBatchType() {
+        const body = document.body;
+        const instr = document.getElementById('batch-instruction');
+        
+        body.classList.remove('mode-positive', 'mode-negative');
+        labelState = {};
+        
+        if (currentBatchType === 'positive') {
+            body.classList.add('mode-positive');
+            instr.innerText = "Verify Positives: Click images that are NOT Positive.";
+            // Default all to Positive (1)
+            currentBatch.forEach(item => labelState[item.id] = 1);
+        } else if (currentBatchType === 'negative') {
+            body.classList.add('mode-negative');
+            instr.innerText = "Verify Negatives: Click images that are NOT Negative.";
+            // Default all to Negative (0)
+            currentBatch.forEach(item => labelState[item.id] = 0);
+        } else {
+            // Neutral/Mixed
+            instr.innerText = "Label Mixed Batch: Click to toggle (Green=Pos, Red=Neg).";
+            // Default: Use model prediction if available, else 0? 
+            // Better: Default to 0 (Negative) as base state? Or explicit unknown?
+            // For binary UI speed, let's default to prediction or 0.
+            currentBatch.forEach(item => {
+                // If model predicted, use it. Else 0.
+                labelState[item.id] = (item.prediction === 1) ? 1 : 0;
+            });
+        }
+    }
+
+    function renderGrid() {
         const grid = document.getElementById('grid');
         grid.innerHTML = '';
         
-        data.forEach(item => {
+        currentBatch.forEach(item => {
             const card = document.createElement('div');
-            card.className = 'card';
             
-            let predText = "No model yet";
-            if (item.prediction !== null) {
-                predText = `Pred: Class ${item.prediction} (${(item.confidence * 100).toFixed(0)}%)`;
+            // Build initial class
+            updateCardClass(card, labelState[item.id]);
+            
+            // Confidence display
+            let confStr = "";
+            if (item.prob_pos !== undefined) {
+                confStr = (item.prob_pos * 100).toFixed(0) + "% Pos";
             }
             
-            // Generate options
-            let options = '<option value="">Select Label...</option>';
-            for (let i = 0; i < 10; i++) {
-                // Pre-select if prediction is high confidence? Maybe not for active learning.
-                options += `<option value="${i}">Class ${i}</option>`;
-            }
-
             card.innerHTML = `
-                <img src="data:image/png;base64,${item.image}" alt="Img ${item.id}">
-                <div class="meta">ID: ${item.id}</div>
-                <div class="prediction">${predText}</div>
-                <select id="sel-${item.id}">
-                    ${options}
-                </select>
+                <img src="data:image/png;base64,${item.image}" alt="${item.id}">
+                <div class="card-overlay">
+                    <span>#${item.id}</span>
+                    <span>${confStr}</span>
+                </div>
             `;
+            
+            card.onclick = () => toggleLabel(item.id, card);
             grid.appendChild(card);
         });
     }
 
+    function updateCardClass(cardElement, label) {
+        cardElement.className = 'card'; // reset
+        if (label === 1) {
+            cardElement.classList.add('is-positive');
+        } else {
+            cardElement.classList.add('is-negative');
+        }
+    }
+
+    function toggleLabel(id, cardElement) {
+        // Flip label
+        labelState[id] = labelState[id] === 1 ? 0 : 1;
+        updateCardClass(cardElement, labelState[id]);
+    }
+
     async function submitBatch() {
         const labels = [];
-        let missing = false;
         
-        currentBatch.forEach(item => {
-            const sel = document.getElementById(`sel-${item.id}`);
-            const val = sel.value;
-            if (val === "") {
-                // It's allowed to skip labels in AL usually, but for this demo let's force or just ignore
-                // Let's ignore skipped ones but ensure at least one is submitted?
-                // Spec says "User chooses a label".
-            } else {
-                labels.push({ id: item.id, label: val });
-            }
-        });
-
-        if (labels.length === 0) {
-            alert("Please label at least one image.");
-            return;
+        // Collect from labelState
+        for (const [id, lbl] of Object.entries(labelState)) {
+            labels.push({ id: parseInt(id), label: lbl });
         }
+
+        if (labels.length === 0) return;
 
         showLoading(true);
         try {
@@ -200,28 +292,24 @@
                 document.getElementById('labeled-count').innerText = result.labeled_count;
                 document.getElementById('unlabeled-count').innerText = result.unlabeled_count;
                 
-                // Automatically load next batch
+                // Auto load next batch
                 await loadBatch();
             }
         } catch (e) {
             console.error(e);
             alert("Error submitting labels");
-            showLoading(false); // only hide if error, otherwise loadBatch handles it
+            showLoading(false);
         }
     }
 
     function showLoading(show) {
         document.getElementById('loading').style.display = show ? 'block' : 'none';
-        if (show) {
-            document.getElementById('grid').style.opacity = '0.5';
-        } else {
-            document.getElementById('grid').style.opacity = '1';
-        }
+        const grid = document.getElementById('grid');
+        if (grid) grid.style.opacity = show ? '0.3' : '1';
     }
     
-    // Initial load
-    window.onload = loadBatch;
-
+    // Initial load? Let user click.
+    // window.onload = loadBatch; 
 </script>
 
 </body>
